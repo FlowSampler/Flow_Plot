@@ -190,6 +190,13 @@ class GatingApp(ttk.Frame):
         ttk.Checkbutton(
             left, text="Auf aktuelle Datei anwenden (Vorschau)",
             variable=self.show_existing_var, command=self._redraw
+        ).pack(anchor="w", padx=4, pady=(0, 2))
+        ttk.Label(
+            left,
+            text="(nur wirksam, solange am Baum noch nichts gezeichnet ist — als Basis, auf der man weitergated; "
+            "sobald ein Gate im Baum existiert, zählt nur noch der Baum selbst, damit Parent/Geschwister nach dem "
+            "Speichern korrekt navigierbar bleiben)",
+            foreground="#555", wraplength=250
         ).pack(anchor="w", padx=4, pady=(0, 8))
 
         # ---- right side: tabs for Gating, Kinetik and Statistik ----
@@ -996,8 +1003,23 @@ class GatingApp(ttk.Frame):
 
     # ---------------------------------------------------------- plotting
     def _base_mask(self, df) -> np.ndarray:
-        """Mask from already-saved gate-sets applicable to the current file (preview only)."""
+        """Mask from already-saved gate-sets applicable to the current file —
+        used ONLY as a starting baseline before you've drawn anything in this
+        session (the live tree is still just the root, no children yet), e.g.
+        to preview a previously committed debris/singlet gate so you can draw
+        today's gates inside it without redrawing it.
+
+        Once you've started building a live tree, this stops contributing.
+        Every gate-set you save is always an export of root->current-node
+        FROM THAT SAME TREE, so once saved it immediately reappears in
+        self.existing_gate_sets — if it kept being ANDed in here, every node
+        in the tree (including ancestors/siblings that gate was never meant
+        to restrict) would get that deep restriction baked back in, making
+        'go to parent'/'show sibling' look stuck showing the child's
+        population instead of their own."""
         if not self.show_existing_var.get() or not self.current_path:
+            return np.ones(len(df), dtype=bool)
+        if self.gate_tree["root"].children:
             return np.ones(len(df), dtype=bool)
         filename = os.path.basename(self.current_path)
         applicable = resolve_gate_sets_for_file(filename, self.existing_gate_sets)
