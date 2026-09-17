@@ -36,8 +36,11 @@ from gating import (
     GateStep,
     add_child_node,
     apply_named_gate_set,
+    delete_gate_tree,
     list_gate_set_names,
+    list_saved_strategies,
     load_all_gate_sets,
+    load_gate_tree,
     new_gate_tree,
     node_mask,
     node_path,
@@ -46,6 +49,7 @@ from gating import (
     remove_subtree,
     resolve_gate_sets_for_file,
     save_gate_set,
+    save_gate_tree,
 )
 from clipboard_utils import copy_figure_to_clipboard
 from io_utils import FcsData, find_fcs_files, load_fcs
@@ -73,7 +77,8 @@ class GatingApp(ttk.Frame):
         super().__init__(master)
         self.input_dir = input_dir
         self.gates_dir = gates_dir
-        self.exports_dir = self._derive_exports_dir(gates_dir)
+        self.exports_dir = self._derive_sibling_dir(gates_dir, "exports")
+        self.strategies_dir = self._derive_sibling_dir(gates_dir, "strategies")
         try:
             self.fcs_paths = find_fcs_files(input_dir, recursive=True)
         except FileNotFoundError:
@@ -89,6 +94,10 @@ class GatingApp(ttk.Frame):
         self.pending_shape_coords = None  # captured at draw-start for the step being drawn
         self.editing_node_id: str | None = None  # set while reshaping an existing gate in place
         self._picking_point_center = False  # True while waiting for the click that sets a quadrant gate's center
+        self.current_strategy_name: str | None = None  # name of the loaded/saved gating strategy, None = unsaved
+        self.current_strategy_path: str | None = None
+        self._strategy_dirty = False  # True once gate_tree has changed since the last strategy save/load
+        self._strategies: list[tuple[str, str]] = []  # (name, path) cache backing the strategy combobox
         self._kin_last_binned = None
         self._kin_last_label = None
         self._kin_last_filename = None
@@ -105,11 +114,11 @@ class GatingApp(ttk.Frame):
         self._bind_file_navigation_keys()
 
     @staticmethod
-    def _derive_exports_dir(gates_dir: str) -> str:
-        """Default export target sits next to the gates folder — inside the
-        experiment folder when gates_dir is '<experiment>/gates'."""
+    def _derive_sibling_dir(gates_dir: str, name: str) -> str:
+        """A default folder next to the gates folder — inside the experiment
+        folder when gates_dir is '<experiment>/gates'."""
         parent = os.path.dirname(os.path.normpath(gates_dir)) or "."
-        return os.path.join(parent, "exports")
+        return os.path.join(parent, name)
 
     def _ensure_exports_dir(self) -> str:
         os.makedirs(self.exports_dir, exist_ok=True)
@@ -358,6 +367,28 @@ class GatingApp(ttk.Frame):
         right = ttk.Frame(gating_pane, width=320)
         gating_pane.add(right, weight=0)
 
+        ttk.Label(right, text="Gating-Strategie", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        ttk.Label(
+            right,
+            text="Der GESAMTE Gate-Baum (alle Äste) unter einem Namen speichern/laden — so lassen sich mehrere "
+            "grundverschiedene Gating-Schemata anlegen, vergleichen und die Arbeit an einem anderen Tag fortsetzen.",
+            foreground="#555", wraplength=300
+        ).pack(anchor="w", padx=4)
+        self.strategy_var = tk.StringVar(value="(unbenannt, nicht gespeichert)")
+        self.strategy_combo = ttk.Combobox(right, textvariable=self.strategy_var, state="readonly")
+        self.strategy_combo.pack(fill="x", padx=4, pady=(4, 2))
+        self.strategy_combo.bind("<<ComboboxSelected>>", self._on_strategy_selected)
+        strategy_btns = ttk.Frame(right)
+        strategy_btns.pack(fill="x", padx=4, pady=(0, 8))
+        ttk.Button(strategy_btns, text="Neu", command=self._new_strategy).pack(side="left", expand=True, fill="x")
+        ttk.Button(strategy_btns, text="Speichern", command=self._save_strategy).pack(side="left", expand=True, fill="x")
+        ttk.Button(
+            strategy_btns, text="Speichern unter...", command=self._save_strategy_as
+        ).pack(side="left", expand=True, fill="x")
+        ttk.Button(strategy_btns, text="Löschen", command=self._delete_strategy).pack(side="left", expand=True, fill="x")
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=4, pady=(0, 8))
+
         ttk.Label(right, text="Pfad (Wurzel → aktuell)", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
         self.breadcrumb_var = tk.StringVar(value="")
         ttk.Label(right, textvariable=self.breadcrumb_var, foreground="#333", wraplength=300, justify="left").pack(
@@ -433,6 +464,7 @@ class GatingApp(ttk.Frame):
 
         self._update_scope_hint()
         self._on_shape_changed()
+        self._refresh_strategy_combo()
 
     def _on_shape_changed(self, _event=None):
         """Enable the angle entry only for the tilted quadrant shape — the
@@ -523,6 +555,31 @@ class GatingApp(ttk.Frame):
             foreground="#555"
         ).grid(row=6, column=0, columnspan=9, sticky="w")
 
+        kin_axis_row = ttk.Frame(controls)
+        kin_axis_row.grid(row=7, column=0, columnspan=9, sticky="w", pady=(6, 0))
+        ttk.Label(kin_axis_row, text="Zeit-Achse Min:").pack(side="left")
+        self.kin_x_min_var = tk.StringVar(value="")
+        ttk.Entry(kin_axis_row, textvariable=self.kin_x_min_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Label(kin_axis_row, text="Max:").pack(side="left")
+        self.kin_x_max_var = tk.StringVar(value="")
+        ttk.Entry(kin_axis_row, textvariable=self.kin_x_max_var, width=8).pack(side="left", padx=(4, 16))
+        ttk.Label(kin_axis_row, text="Werte-Achse Min:").pack(side="left")
+        self.kin_y_min_var = tk.StringVar(value="")
+        ttk.Entry(kin_axis_row, textvariable=self.kin_y_min_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Label(kin_axis_row, text="Max:").pack(side="left")
+        self.kin_y_max_var = tk.StringVar(value="")
+        ttk.Entry(kin_axis_row, textvariable=self.kin_y_max_var, width=8).pack(side="left", padx=(4, 16))
+        for v in (self.kin_x_min_var, self.kin_x_max_var, self.kin_y_min_var, self.kin_y_max_var):
+            v.trace_add("write", lambda *a: self._redraw_kinetics())
+        ttk.Button(
+            kin_axis_row, text="Zurücksetzen (Auto)", command=self._reset_kinetics_axis_limits
+        ).pack(side="left")
+        ttk.Label(
+            controls, text="(Achsen-Limits: leer = automatisch — zum Reinzoomen in einen Zeit-/Wertebereich "
+            "einfach Min/Max eintragen; die Toolbar-Lupe unten funktioniert ebenfalls)",
+            foreground="#555"
+        ).grid(row=8, column=0, columnspan=9, sticky="w")
+
         self.kin_figure = Figure(figsize=(8, 6))
         self.kin_ax = self.kin_figure.add_subplot(111)
         self.kin_canvas = FigureCanvasTkAgg(self.kin_figure, master=parent)
@@ -540,6 +597,20 @@ class GatingApp(ttk.Frame):
         is_ratio = self.kin_mode_var.get() == "ratio"
         self.kin_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
         self.kin_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+
+    @staticmethod
+    def _parse_optional_float(s: str) -> float | None:
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    def _reset_kinetics_axis_limits(self):
+        for v in (self.kin_x_min_var, self.kin_x_max_var, self.kin_y_min_var, self.kin_y_max_var):
+            v.set("")
 
     def _build_stats_tab(self, parent):
         controls = ttk.Frame(parent)
@@ -819,12 +890,16 @@ class GatingApp(ttk.Frame):
         self.input_dir = root_dir
         self.gates_dir = os.path.join(root_dir, "gates")
         self.exports_dir = os.path.join(root_dir, "exports")
+        self.strategies_dir = os.path.join(root_dir, "strategies")
         self.fcs_paths = fcs_paths
         self.data_cache.clear()
         self.existing_gate_sets = load_all_gate_sets(self.gates_dir)
         self.gate_tree = new_gate_tree()
         self.current_node_id = "root"
         self._node_counter = 0
+        self.current_strategy_name = None
+        self.current_strategy_path = None
+        self._strategy_dirty = False
         self.cohort_df = None
 
         self.experiment_dir_var.set(self.input_dir)
@@ -832,10 +907,11 @@ class GatingApp(ttk.Frame):
         for p in self.fcs_paths:
             self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
         self._refresh_existing_listbox()
+        self._refresh_strategy_combo()
         self._select_file_index(0)
         self.status_var.set(
             f"Experiment geladen: {len(self.fcs_paths)} FCS-Datei(en) aus '{root_dir}'. "
-            f"Gates: '{self.gates_dir}', Exporte: '{self.exports_dir}'."
+            f"Gates: '{self.gates_dir}', Exporte: '{self.exports_dir}', Strategien: '{self.strategies_dir}'."
         )
 
     # ---------------------------------------------------------- data access
@@ -1211,8 +1287,19 @@ class GatingApp(ttk.Frame):
     def _gate_tree_counts(self, df) -> dict[str, tuple[int, float]]:
         """DFS over the WHOLE tree (not just the current node's lineage),
         returning {node_id: (n_events, pct_of_parent)} so the tree panel can
-        show every gate's size at a glance without navigating to it."""
-        base_mask = self._base_mask(df)
+        show every gate's size at a glance without navigating to it.
+
+        Deliberately starts from the RAW, unfiltered event count — NOT
+        _base_mask()/the saved-gate-sets preview. Those saved gate-sets often
+        duplicate steps that already exist as nodes in this very tree (e.g.
+        right after you save one, or when you've redrawn a previously-saved
+        gate to keep extending it); folding them in here would make an
+        already-applied step's own gate look like a 100%-passthrough at every
+        level below it, since it becomes a no-op AND against a population
+        that's secretly already been restricted to the same boundary. The
+        live tree's own steps are the only thing this panel needs — what
+        _base_mask() additionally restricts is a separate, PLOT-only preview
+        (see _redraw/_cumulative_pending_mask)."""
         counts: dict[str, tuple[int, float]] = {}
 
         def walk(node_id: str, parent_mask: np.ndarray, parent_total: int):
@@ -1224,7 +1311,7 @@ class GatingApp(ttk.Frame):
             for child_id in node.children:
                 walk(child_id, mask, n)
 
-        walk("root", base_mask, len(df))
+        walk("root", np.ones(len(df), dtype=bool), len(df))
         return counts
 
     def _refresh_gate_tree_view(self, df):
@@ -1318,6 +1405,7 @@ class GatingApp(ttk.Frame):
         parent_id = node.parent_id
         self._cancel_drawing()
         remove_subtree(self.gate_tree, node_id)
+        self._mark_strategy_dirty()
         if need_navigate_up:
             self._navigate_to(parent_id)
         else:
@@ -1430,6 +1518,7 @@ class GatingApp(ttk.Frame):
             messagebox.showwarning("Name fehlt", "Der Name darf nicht leer sein.")
             return
         node.name = new_name
+        self._mark_strategy_dirty()
         self._redraw()
 
     def _start_editing_node(self, node_id: str):
@@ -1495,7 +1584,127 @@ class GatingApp(ttk.Frame):
         self.gate_tree = new_gate_tree()
         self.current_node_id = "root"
         self._node_counter = 0
+        self.current_strategy_name = None
+        self.current_strategy_path = None
+        self._strategy_dirty = False
+        self.strategy_var.set("(unbenannt, nicht gespeichert)")
         self._redraw()
+
+    # ---------------------------------------------------------- gating strategies (whole-tree save/load)
+    def _mark_strategy_dirty(self):
+        self._strategy_dirty = True
+
+    def _refresh_strategy_combo(self):
+        self._strategies = list_saved_strategies(self.strategies_dir)
+        names = [n for n, _ in self._strategies]
+        self.strategy_combo["values"] = names
+        if self.current_strategy_name in names:
+            self.strategy_var.set(self.current_strategy_name)
+        elif self.current_strategy_name is None:
+            self.strategy_var.set("(unbenannt, nicht gespeichert)")
+
+    def _strategy_path_for_name(self, name: str) -> str | None:
+        for n, p in self._strategies:
+            if n == name:
+                return p
+        return None
+
+    def _confirm_discard_current_strategy(self) -> bool:
+        if not self._strategy_dirty:
+            return True
+        return messagebox.askyesno(
+            "Ungespeicherte Änderungen",
+            "Die aktuelle Gating-Strategie hat ungespeicherte Änderungen. Trotzdem verwerfen und wechseln?"
+        )
+
+    def _new_strategy(self):
+        if not self._confirm_discard_current_strategy():
+            return
+        self._cancel_drawing()
+        self.gate_tree = new_gate_tree()
+        self.current_node_id = "root"
+        self._node_counter = 0
+        self.current_strategy_name = None
+        self.current_strategy_path = None
+        self._strategy_dirty = False
+        self.strategy_var.set("(unbenannt, nicht gespeichert)")
+        self._redraw()
+        self.status_var.set("Neue, leere Gating-Strategie gestartet.")
+
+    def _save_strategy(self):
+        if self.current_strategy_name is None:
+            self._save_strategy_as()
+            return
+        path = save_gate_tree(self.gate_tree, self.current_strategy_name, self.strategies_dir)
+        self.current_strategy_path = path
+        self._strategy_dirty = False
+        self._refresh_strategy_combo()
+        self.status_var.set(f"Gating-Strategie '{self.current_strategy_name}' gespeichert.")
+
+    def _save_strategy_as(self):
+        name = simpledialog.askstring(
+            "Strategie speichern unter...", "Name der Gating-Strategie:",
+            initialvalue=self.current_strategy_name or "", parent=self,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("Name fehlt", "Der Name darf nicht leer sein.")
+            return
+        path = save_gate_tree(self.gate_tree, name, self.strategies_dir)
+        self.current_strategy_name = name
+        self.current_strategy_path = path
+        self._strategy_dirty = False
+        self._refresh_strategy_combo()
+        self.status_var.set(f"Gating-Strategie '{name}' gespeichert unter:\n{path}")
+
+    def _on_strategy_selected(self, _event=None):
+        name = self.strategy_var.get()
+        if name == self.current_strategy_name:
+            return
+        path = self._strategy_path_for_name(name)
+        if path is None:
+            return
+        if not self._confirm_discard_current_strategy():
+            self.strategy_var.set(self.current_strategy_name or "(unbenannt, nicht gespeichert)")
+            return
+        self._load_strategy(path, name)
+
+    def _load_strategy(self, path: str, name: str):
+        try:
+            tree, node_counter = load_gate_tree(path)
+        except Exception as exc:
+            messagebox.showerror("Fehler beim Laden", f"Konnte Strategie nicht laden:\n{exc}")
+            return
+        self._cancel_drawing()
+        self.gate_tree = tree
+        self.current_node_id = "root"
+        self._node_counter = node_counter
+        self.current_strategy_name = name
+        self.current_strategy_path = path
+        self._strategy_dirty = False
+        self._redraw()
+        self.status_var.set(f"Gating-Strategie '{name}' geladen ({len(tree) - 1} Gate(s)).")
+
+    def _delete_strategy(self):
+        if self.current_strategy_name is None or self.current_strategy_path is None:
+            messagebox.showinfo("Keine Strategie geladen", "Es ist keine gespeicherte Strategie aktuell geladen.")
+            return
+        if not messagebox.askyesno(
+            "Strategie löschen?",
+            f"Gespeicherte Datei für '{self.current_strategy_name}' wirklich löschen? "
+            "(Der gerade angezeigte Gate-Baum bleibt bis zum Wechsel/Schließen erhalten, ist danach aber nicht "
+            "mehr wiederherstellbar, falls nicht anderweitig gespeichert.)"
+        ):
+            return
+        delete_gate_tree(self.current_strategy_path)
+        self.current_strategy_name = None
+        self.current_strategy_path = None
+        self._strategy_dirty = True
+        self._refresh_strategy_combo()
+        self.strategy_var.set("(unbenannt, nicht gespeichert)")
+        self.status_var.set("Gespeicherte Strategie-Datei gelöscht.")
 
     # ---------------------------------------------------------- drawing
     def _quadrant_angle_value(self) -> float:
@@ -1593,6 +1802,7 @@ class GatingApp(ttk.Frame):
             add_child_node(self.gate_tree, self.current_node_id, step, name, node_id)
             created_names.append(name)
 
+        self._mark_strategy_dirty()
         self._teardown_selector()
         self._redraw()
         self.status_var.set(
@@ -1641,6 +1851,7 @@ class GatingApp(ttk.Frame):
         if self.editing_node_id is not None:
             node = self.gate_tree[self.editing_node_id]
             node.step = step  # node id, name and children stay exactly as they were
+            self._mark_strategy_dirty()
             message = f"Gate '{node.name}' aktualisiert — Name und Kind-Gates bleiben erhalten."
             self.editing_node_id = None
         else:
@@ -1652,6 +1863,7 @@ class GatingApp(ttk.Frame):
             node_id = f"node_{self._node_counter}"
             self._node_counter += 1
             add_child_node(self.gate_tree, self.current_node_id, step, default_name, node_id)
+            self._mark_strategy_dirty()
             self._teardown_selector()
             self._redraw()
             self._rename_node(node_id)
@@ -1786,6 +1998,18 @@ class GatingApp(ttk.Frame):
         self.kin_ax.set_xlabel("Zeit (s)")
         self.kin_ax.set_ylabel(f"{ylabel} (Median pro Bin)")
         self.kin_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events")
+
+        # Manual axis limits to zoom into a time/value range; a bound left
+        # blank keeps that side auto-scaled from the data as before.
+        x_lo = self._parse_optional_float(self.kin_x_min_var.get())
+        x_hi = self._parse_optional_float(self.kin_x_max_var.get())
+        y_lo = self._parse_optional_float(self.kin_y_min_var.get())
+        y_hi = self._parse_optional_float(self.kin_y_max_var.get())
+        if x_lo is not None or x_hi is not None:
+            self.kin_ax.set_xlim(left=x_lo, right=x_hi)
+        if y_lo is not None or y_hi is not None:
+            self.kin_ax.set_ylim(bottom=y_lo, top=y_hi)
+
         self.kin_canvas.draw_idle()
 
         n_bins = len(binned)

@@ -261,3 +261,92 @@ def remove_subtree(tree: dict[str, GateNode], node_id: str) -> None:
     if parent is not None and node_id in parent.children:
         parent.children.remove(node_id)
     del tree[node_id]
+
+
+# --------------------------------------------------------------------------
+# Whole-tree persistence ("gating strategies"): unlike a GateSet (one linear
+# root->node path, exported for Kinetik/Statistik to apply), this saves the
+# ENTIRE editable tree — every branch/sibling — so a gating session can be
+# closed and reopened later, or so several genuinely different gating
+# schemes (e.g. different populations/inputs) can be saved side by side and
+# switched between in the GUI.
+# --------------------------------------------------------------------------
+
+
+def _step_to_dict(step: GateStep | None) -> dict | None:
+    if step is None:
+        return None
+    return {
+        "x_channel": step.x_channel,
+        "y_channel": step.y_channel,
+        "shape": step.shape,
+        "vertices": step.vertices,
+        "params": step.params,
+    }
+
+
+def save_gate_tree(tree: dict[str, GateNode], name: str, strategies_dir: str) -> str:
+    os.makedirs(strategies_dir, exist_ok=True)
+    nodes_payload = {
+        node_id: {
+            "parent_id": node.parent_id,
+            "name": node.name,
+            "step": _step_to_dict(node.step),
+            "children": list(node.children),
+        }
+        for node_id, node in tree.items()
+    }
+    payload = {"name": name, "nodes": nodes_payload}
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    out_path = os.path.join(strategies_dir, f"{safe_name}.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return out_path
+
+
+def load_gate_tree(path: str) -> tuple[dict[str, GateNode], int]:
+    """Returns (tree, next_node_counter) — the counter is derived from the
+    highest existing 'node_<i>' id so newly drawn gates keep getting unique
+    ids after reloading."""
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = json.load(fh)
+    tree: dict[str, GateNode] = {}
+    for node_id, n in raw["nodes"].items():
+        step_dict = n.get("step")
+        step = GateStep(**step_dict) if step_dict else None
+        tree[node_id] = GateNode(
+            node_id=node_id, parent_id=n.get("parent_id"), step=step,
+            name=n.get("name", ""), children=list(n.get("children", [])),
+        )
+    max_idx = -1
+    for node_id in tree:
+        if node_id.startswith("node_"):
+            try:
+                max_idx = max(max_idx, int(node_id.split("_", 1)[1]))
+            except ValueError:
+                pass
+    return tree, max_idx + 1
+
+
+def list_saved_strategies(strategies_dir: str) -> list[tuple[str, str]]:
+    """(display_name, path) pairs for every saved strategy, sorted by name."""
+    if not os.path.isdir(strategies_dir):
+        return []
+    out = []
+    for f in sorted(os.listdir(strategies_dir)):
+        if not f.lower().endswith(".json"):
+            continue
+        path = os.path.join(strategies_dir, f)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                name = json.load(fh).get("name") or os.path.splitext(f)[0]
+        except (json.JSONDecodeError, OSError):
+            name = os.path.splitext(f)[0]
+        out.append((name, path))
+    out.sort(key=lambda t: t[0].lower())
+    return out
+
+
+def delete_gate_tree(path: str) -> None:
+    if os.path.exists(path):
+        os.remove(path)
