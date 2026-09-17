@@ -1,0 +1,1978 @@
+"""Interactive GUI for defining pregates on FCS files.
+
+Navigate between files in a list, pick the X/Y channels from dropdowns, pick a
+gate shape (Polygon / Rectangle / Ellipse), draw it on the density plot. Gates
+form a tree (like FlowJo): drawing a gate adds a CHILD of the currently viewed
+population without leaving it, so you can draw several sibling gates (Child A,
+Child B, ...) at the same hierarchy level. Double-click inside a drawn gate
+(or double-click it in the "Kind-Gates" list) to descend into that population;
+the breadcrumb at the top of the right panel navigates back up. Saving a
+gate-set stores the path from the root down to whichever node is currently
+displayed, with a scope (all files / a group / just this one file).
+
+Run with:
+    python gating_gui.py
+    python gating_gui.py --input-dir "..\\Ca2+_kinetic" --gates-dir "..\\gates"
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+import numpy as np
+import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from matplotlib.patches import Ellipse as EllipsePatch
+from matplotlib.patches import Polygon as PolygonPatch
+from matplotlib.widgets import EllipseSelector, PolygonSelector, RectangleSelector
+from scipy.ndimage import gaussian_filter
+
+from gating import (
+    GateSet,
+    GateStep,
+    add_child_node,
+    apply_named_gate_set,
+    list_gate_set_names,
+    load_all_gate_sets,
+    new_gate_tree,
+    node_mask,
+    node_path,
+    node_steps,
+    point_in_step,
+    remove_subtree,
+    resolve_gate_sets_for_file,
+    save_gate_set,
+)
+from clipboard_utils import copy_figure_to_clipboard
+from io_utils import FcsData, find_fcs_files, load_fcs
+from kinetics import bin_kinetics, compute_ratio, parse_baseline_duration_s, value_stats
+from run_pipeline import plot_kinetics
+from transforms import TRANSFORM_NAMES, apply_axis_scale
+
+SHAPES = ["Polygon", "Rectangle", "Ellipse", "Quadrant", "Quadrant (Winkel)"]
+QUADRANT_SHAPES = ("Quadrant", "Quadrant (Winkel)")
+SCOPES = ["all", "group", "file"]
+PLOT_TYPES = ["Scatter", "Histogram", "Density", "Contour"]
+DEFAULT_CHANNEL_PAIR = ("FSC-A", "SSC-A")
+DEFAULT_RATIO_PAIR = ("PerCP-A", "Qdot 655-A")
+
+# Options for the "which population?" selector in the Kinetik/Statistik tabs.
+# Picking a specific saved gate-set NAME avoids silently ANDing together every
+# saved gate-set that happens to match a file's scope — important once you
+# have several mutually exclusive named populations (e.g. "Lebend"/"Dead").
+GATE_SOURCE_LIVE = "Live (Gating-Tab-Ansicht, nur aktuelle Datei)"
+GATE_SOURCE_NONE = "Ungegated (alle Events)"
+
+
+class GatingApp(ttk.Frame):
+    def __init__(self, master, input_dir: str, gates_dir: str):
+        super().__init__(master)
+        self.input_dir = input_dir
+        self.gates_dir = gates_dir
+        self.exports_dir = self._derive_exports_dir(gates_dir)
+        try:
+            self.fcs_paths = find_fcs_files(input_dir, recursive=True)
+        except FileNotFoundError:
+            self.fcs_paths = []
+        self.data_cache: dict[str, FcsData] = {}
+        self.existing_gate_sets = load_all_gate_sets(gates_dir)
+
+        self.current_path: str | None = None
+        self.gate_tree = new_gate_tree()
+        self.current_node_id = "root"
+        self._node_counter = 0
+        self.active_selector = None
+        self.pending_shape_coords = None  # captured at draw-start for the step being drawn
+        self.editing_node_id: str | None = None  # set while reshaping an existing gate in place
+        self._picking_point_center = False  # True while waiting for the click that sets a quadrant gate's center
+        self._kin_last_binned = None
+        self._kin_last_label = None
+        self._kin_last_filename = None
+        self._kin_last_population = None
+
+        self._build_ui()
+        if self.fcs_paths:
+            self._select_file_index(0)
+        else:
+            self.status_var.set(
+                "Kein Experiment-Ordner geladen (oder keine .fcs-Dateien darin gefunden). "
+                "Bitte oben links 'Experiment-Ordner wählen...' klicken."
+            )
+        self._bind_file_navigation_keys()
+
+    @staticmethod
+    def _derive_exports_dir(gates_dir: str) -> str:
+        """Default export target sits next to the gates folder — inside the
+        experiment folder when gates_dir is '<experiment>/gates'."""
+        parent = os.path.dirname(os.path.normpath(gates_dir)) or "."
+        return os.path.join(parent, "exports")
+
+    def _ensure_exports_dir(self) -> str:
+        os.makedirs(self.exports_dir, exist_ok=True)
+        return self.exports_dir
+
+    def _bind_file_navigation_keys(self):
+        """Left/Right arrow keys cycle through ALL files, wrapping around at
+        either end, no matter which widget currently has focus — except while
+        typing in a text-entry-like widget, where the arrow keys keep their
+        normal cursor-movement behavior instead."""
+
+        def handle(direction):
+            def _handler(event):
+                if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Combobox, tk.Text, tk.Spinbox)):
+                    return
+                if direction < 0:
+                    self._prev_file()
+                else:
+                    self._next_file()
+                return "break"
+            return _handler
+
+        self.master.bind_all("<Left>", handle(-1))
+        self.master.bind_all("<Right>", handle(1))
+
+    # ---------------------------------------------------------- UI layout
+    def _build_ui(self):
+        self.pack(fill="both", expand=True)
+
+        root_pane = ttk.PanedWindow(self, orient="horizontal")
+        root_pane.pack(fill="both", expand=True)
+
+        # ---- left: file navigator ----
+        left = ttk.Frame(root_pane, width=260)
+        root_pane.add(left, weight=0)
+
+        ttk.Label(left, text="Experiment", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        self.experiment_dir_var = tk.StringVar(value=self.input_dir)
+        ttk.Label(
+            left, textvariable=self.experiment_dir_var, foreground="#555", wraplength=250, justify="left"
+        ).pack(anchor="w", padx=4)
+        ttk.Button(left, text="Experiment-Ordner wählen...", command=self._choose_experiment_folder).pack(
+            fill="x", padx=4, pady=(2, 8)
+        )
+        ttk.Label(
+            left,
+            text="(lädt automatisch alle .fcs-Dateien aus diesem Ordner + Unterordnern; "
+            "Gates und Exporte werden dort in 'gates/' bzw. 'exports/' gespeichert)",
+            foreground="#555", wraplength=250
+        ).pack(anchor="w", padx=4, pady=(0, 8))
+
+        ttk.Label(left, text="FCS Dateien", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        self.file_listbox = tk.Listbox(left, exportselection=False)
+        for p in self.fcs_paths:
+            self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
+        self.file_listbox.pack(fill="both", expand=True, padx=4, pady=4)
+        self.file_listbox.bind("<<ListboxSelect>>", self._on_file_selected)
+
+        nav = ttk.Frame(left)
+        nav.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(nav, text="<< Prev", command=self._prev_file).pack(side="left", expand=True, fill="x")
+        ttk.Button(nav, text="Next >>", command=self._next_file).pack(side="left", expand=True, fill="x")
+
+        ttk.Label(left, text="Existierende Gate-Sets", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(8, 0))
+        self.existing_listbox = tk.Listbox(left, height=6)
+        self._refresh_existing_listbox()
+        self.existing_listbox.pack(fill="x", padx=4, pady=4)
+        self.show_existing_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            left, text="Auf aktuelle Datei anwenden (Vorschau)",
+            variable=self.show_existing_var, command=self._redraw
+        ).pack(anchor="w", padx=4, pady=(0, 8))
+
+        # ---- right side: tabs for Gating, Kinetik and Statistik ----
+        self.notebook = ttk.Notebook(root_pane)
+        root_pane.add(self.notebook, weight=1)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        gating_tab = ttk.Frame(self.notebook)
+        kinetics_tab = ttk.Frame(self.notebook)
+        stats_tab = ttk.Frame(self.notebook)
+        self.notebook.add(gating_tab, text="Gating")
+        self.notebook.add(kinetics_tab, text="Kinetik")
+        self.notebook.add(stats_tab, text="Statistik")
+
+        self._build_gating_tab(gating_tab)
+        self._build_kinetics_tab(kinetics_tab)
+        self._build_stats_tab(stats_tab)
+        self._refresh_gate_source_combos()
+
+    def _on_tab_changed(self, _event):
+        idx = self.notebook.index(self.notebook.select())
+        if idx == 1:
+            self._redraw_kinetics()
+        elif idx == 2:
+            self._redraw_stats()
+
+    def _build_gating_tab(self, parent):
+        gating_pane = ttk.PanedWindow(parent, orient="horizontal")
+        gating_pane.pack(fill="both", expand=True)
+
+        # ---- center: plot ----
+        center = ttk.Frame(gating_pane)
+        gating_pane.add(center, weight=1)
+
+        controls = ttk.Frame(center)
+        controls.pack(fill="x", padx=4, pady=4)
+
+        ttk.Label(controls, text="X-Kanal:").grid(row=0, column=0, sticky="w")
+        self.x_channel_var = tk.StringVar(value=DEFAULT_CHANNEL_PAIR[0])
+        self.x_channel_combo = ttk.Combobox(controls, textvariable=self.x_channel_var, state="readonly", width=14)
+        self.x_channel_combo.grid(row=0, column=1, padx=4)
+        self.x_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+
+        ttk.Label(controls, text="Y-Kanal:").grid(row=0, column=2, sticky="w")
+        self.y_channel_var = tk.StringVar(value=DEFAULT_CHANNEL_PAIR[1])
+        self.y_channel_combo = ttk.Combobox(controls, textvariable=self.y_channel_var, state="readonly", width=14)
+        self.y_channel_combo.grid(row=0, column=3, padx=4)
+        self.y_channel_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+
+        ttk.Label(controls, text="Gate-Form:").grid(row=0, column=4, sticky="w", padx=(12, 0))
+        self.shape_var = tk.StringVar(value=SHAPES[0])
+        self.shape_combo = ttk.Combobox(controls, textvariable=self.shape_var, state="readonly", values=SHAPES, width=16)
+        self.shape_combo.grid(row=0, column=5, padx=4)
+        self.shape_combo.bind("<<ComboboxSelected>>", self._on_shape_changed)
+
+        self.draw_button = ttk.Button(controls, text="Gate zeichnen starten", command=self._start_drawing)
+        self.draw_button.grid(row=0, column=6, padx=(12, 4))
+        self.finish_button = ttk.Button(controls, text="Schritt übernehmen", command=self._finish_step, state="disabled")
+        self.finish_button.grid(row=0, column=7, padx=4)
+        self.cancel_button = ttk.Button(controls, text="Abbrechen", command=self._cancel_drawing, state="disabled")
+        self.cancel_button.grid(row=0, column=8, padx=4)
+
+        ttk.Label(controls, text="Darstellung:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.plot_type_var = tk.StringVar(value=PLOT_TYPES[0])
+        plot_type_combo = ttk.Combobox(
+            controls, textvariable=self.plot_type_var, state="readonly", values=PLOT_TYPES, width=10
+        )
+        plot_type_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
+        plot_type_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+        ttk.Label(
+            controls, text="(Histogram/Density/Contour zeigen die Verteilung zur Gate-Abschätzung)",
+            foreground="#555"
+        ).grid(row=1, column=2, columnspan=5, sticky="w", pady=(6, 0))
+
+        ttk.Label(controls, text="Quadranten-Winkel (°):").grid(row=1, column=7, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.quadrant_angle_var = tk.StringVar(value="0")
+        self.quadrant_angle_entry = ttk.Entry(
+            controls, textvariable=self.quadrant_angle_var, width=6, state="disabled"
+        )
+        self.quadrant_angle_entry.grid(row=1, column=8, padx=4, pady=(6, 0), sticky="w")
+        self.quadrant_angle_var.trace_add("write", lambda *a: self._redraw())
+
+        ttk.Label(controls, text="X-Transform:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.x_transform_var = tk.StringVar(value="Linear")
+        x_transform_combo = ttk.Combobox(
+            controls, textvariable=self.x_transform_var, state="readonly", values=TRANSFORM_NAMES, width=10
+        )
+        x_transform_combo.grid(row=2, column=1, padx=4, pady=(6, 0))
+        x_transform_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+
+        ttk.Label(controls, text="Y-Transform:").grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.y_transform_var = tk.StringVar(value="Linear")
+        y_transform_combo = ttk.Combobox(
+            controls, textvariable=self.y_transform_var, state="readonly", values=TRANSFORM_NAMES, width=10
+        )
+        y_transform_combo.grid(row=2, column=3, padx=4, pady=(6, 0))
+        y_transform_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+
+        ttk.Label(controls, text="Log linthresh:").grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.log_linthresh_var = tk.StringVar(value="10")
+        ttk.Entry(controls, textvariable=self.log_linthresh_var, width=6).grid(row=2, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Logicle W:").grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.logicle_w_var = tk.StringVar(value="0.5")
+        ttk.Entry(controls, textvariable=self.logicle_w_var, width=5).grid(row=2, column=7, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Logicle M:").grid(row=2, column=8, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.logicle_m_var = tk.StringVar(value="4.5")
+        ttk.Entry(controls, textvariable=self.logicle_m_var, width=5).grid(row=2, column=9, padx=4, pady=(6, 0))
+        for v in (self.log_linthresh_var, self.logicle_w_var, self.logicle_m_var):
+            v.trace_add("write", lambda *a: self._redraw())
+
+        ttk.Label(
+            controls,
+            text="Linear / Log (symlog, verträgt negative Rauschwerte) / Logicle (FlowKit-Standardtransform). "
+            "Ändert nur die Darstellung, Gate-Koordinaten bleiben in Rohwerten.",
+            foreground="#555", wraplength=760,
+        ).grid(row=3, column=0, columnspan=10, sticky="w", pady=(4, 0))
+
+        axis_limits_row = ttk.Frame(controls)
+        axis_limits_row.grid(row=4, column=0, columnspan=10, sticky="w", pady=(6, 0))
+
+        ttk.Label(axis_limits_row, text="X-Achse Min:").pack(side="left")
+        self.x_min_var = tk.StringVar(value="")
+        ttk.Entry(axis_limits_row, textvariable=self.x_min_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Label(axis_limits_row, text="Max:").pack(side="left")
+        self.x_max_var = tk.StringVar(value="")
+        ttk.Entry(axis_limits_row, textvariable=self.x_max_var, width=8).pack(side="left", padx=(4, 16))
+
+        ttk.Label(axis_limits_row, text="Y-Achse Min:").pack(side="left")
+        self.y_min_var = tk.StringVar(value="")
+        ttk.Entry(axis_limits_row, textvariable=self.y_min_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Label(axis_limits_row, text="Max:").pack(side="left")
+        self.y_max_var = tk.StringVar(value="")
+        ttk.Entry(axis_limits_row, textvariable=self.y_max_var, width=8).pack(side="left", padx=(4, 16))
+        for v in (self.x_min_var, self.x_max_var, self.y_min_var, self.y_max_var):
+            v.trace_add("write", lambda *a: self._redraw())
+
+        ttk.Button(
+            axis_limits_row, text="Ausreißer abschneiden (1.–99. Perzentil)", command=self._autofit_axis_limits
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            axis_limits_row, text="Achsen-Limits zurücksetzen (Auto)", command=self._reset_axis_limits
+        ).pack(side="left", padx=(4, 0))
+
+        ttk.Label(
+            controls,
+            text="Leer = automatisch. Ein gesetztes Limit schneidet Ausreißer an den Rand ab (statt die Achse "
+            "zu sprengen) und markiert sie dort rot mit '×'.",
+            foreground="#555", wraplength=760,
+        ).grid(row=5, column=0, columnspan=10, sticky="w", pady=(2, 0))
+
+        self.figure = Figure(figsize=(7, 6))
+        self.ax = self.figure.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=center)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        toolbar_row = ttk.Frame(center)
+        toolbar_row.pack(fill="x")
+        toolbar = NavigationToolbar2Tk(self.canvas, toolbar_row, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left")
+        ttk.Button(
+            toolbar_row, text="Plot in Zwischenablage kopieren",
+            command=lambda: self._copy_to_clipboard(self.figure, self.status_var)
+        ).pack(side="left", padx=(8, 0))
+
+        self.status_var = tk.StringVar(
+            value="Bereit. Doppelklick IN ein Gate wechselt in dessen Population. "
+            "Klick AUF die rote Gate-Linie bearbeitet dessen Ecken/Ränder."
+        )
+        ttk.Label(center, textvariable=self.status_var, anchor="w").pack(fill="x", padx=4, pady=(0, 4))
+
+        # ---- right: gate hierarchy navigation + save ----
+        right = ttk.Frame(gating_pane, width=320)
+        gating_pane.add(right, weight=0)
+
+        ttk.Label(right, text="Pfad (Wurzel → aktuell)", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        self.breadcrumb_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.breadcrumb_var, foreground="#333", wraplength=300, justify="left").pack(
+            anchor="w", padx=4, pady=(0, 6)
+        )
+        ttk.Button(right, text="▲ Eine Ebene hoch (Parent)", command=self._go_to_parent).pack(fill="x", padx=4, pady=(0, 8))
+
+        ttk.Label(right, text="Gate-Baum (gesamte Hierarchie)", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        ttk.Label(
+            right,
+            text="(untereinander & eingerückt je Ebene; aktuelle Ansicht ist markiert; "
+            "Doppelklick navigiert hinein)",
+            foreground="#555", wraplength=300
+        ).pack(anchor="w", padx=4)
+
+        tree_container = ttk.Frame(right)
+        tree_container.pack(fill="both", expand=True, padx=4, pady=4)
+        self.tree_view = ttk.Treeview(tree_container, columns=("events",), show="tree headings", height=14)
+        self.tree_view.heading("#0", text="Gate")
+        self.tree_view.heading("events", text="Events (% Parent)")
+        self.tree_view.column("#0", width=170, stretch=True)
+        self.tree_view.column("events", width=110, anchor="e", stretch=False)
+        tree_vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree_view.yview)
+        self.tree_view.configure(yscrollcommand=tree_vsb.set)
+        self.tree_view.pack(side="left", fill="both", expand=True)
+        tree_vsb.pack(side="right", fill="y")
+        self.tree_view.tag_configure("current", background="#cfe8ff")
+        self.tree_view.bind("<Double-Button-1>", self._on_tree_double_click)
+
+        tree_btns = ttk.Frame(right)
+        tree_btns.pack(fill="x", padx=4)
+        ttk.Button(tree_btns, text="In ausgewählten Knoten wechseln", command=self._navigate_selected_tree_node).pack(fill="x", pady=2)
+        ttk.Button(tree_btns, text="Ausgewählten Knoten umbenennen", command=self._rename_tree_selected).pack(fill="x", pady=2)
+        ttk.Button(
+            tree_btns, text="Ausgewählten Knoten bearbeiten (Ecken anpassen)", command=self._edit_tree_selected
+        ).pack(fill="x", pady=2)
+        ttk.Button(tree_btns, text="Ausgewählten Knoten + Kinder löschen", command=self._delete_tree_selected).pack(fill="x", pady=2)
+        ttk.Button(tree_btns, text="Baum zurücksetzen", command=self._reset_tree).pack(fill="x", pady=2)
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", padx=4, pady=10)
+
+        ttk.Label(right, text="Speichern als Gate-Set", font=("", 10, "bold")).pack(anchor="w", padx=4)
+        ttk.Label(
+            right, text="Speichert den Pfad Wurzel → aktuell angezeigter Knoten als Gate-Set.",
+            foreground="#555", wraplength=250
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+
+        form = ttk.Frame(right)
+        form.pack(fill="x", padx=4, pady=4)
+
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky="w")
+        self.name_var = tk.StringVar(value="gate_set")
+        ttk.Entry(form, textvariable=self.name_var).grid(row=0, column=1, sticky="ew", pady=2)
+
+        ttk.Label(form, text="Scope:").grid(row=1, column=0, sticky="w")
+        self.scope_var = tk.StringVar(value="all")
+        scope_combo = ttk.Combobox(form, textvariable=self.scope_var, state="readonly", values=SCOPES, width=10)
+        scope_combo.grid(row=1, column=1, sticky="ew", pady=2)
+        scope_combo.bind("<<ComboboxSelected>>", lambda e: self._update_scope_hint())
+
+        ttk.Label(form, text="Pattern (group):").grid(row=2, column=0, sticky="w")
+        self.pattern_var = tk.StringVar(value="")
+        ttk.Entry(form, textvariable=self.pattern_var).grid(row=2, column=1, sticky="ew", pady=2)
+
+        form.columnconfigure(1, weight=1)
+
+        self.scope_hint_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.scope_hint_var, foreground="#555", wraplength=250).pack(
+            anchor="w", padx=4, pady=(0, 8)
+        )
+
+        ttk.Button(right, text="Gate-Set speichern", command=self._save_gate_set).pack(fill="x", padx=4, pady=(8, 4))
+
+        self._update_scope_hint()
+        self._on_shape_changed()
+
+    def _on_shape_changed(self, _event=None):
+        """Enable the angle entry only for the tilted quadrant shape — the
+        straight one is always axis-aligned (angle 0)."""
+        is_angled = self.shape_var.get() == "Quadrant (Winkel)"
+        self.quadrant_angle_entry.configure(state="normal" if is_angled else "disabled")
+
+    def _build_kinetics_tab(self, parent):
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", padx=4, pady=4)
+
+        ttk.Label(controls, text="Quelle:").grid(row=0, column=0, sticky="w")
+        self.kin_mode_var = tk.StringVar(value="ratio")
+        mode_frame = ttk.Frame(controls)
+        mode_frame.grid(row=0, column=1, columnspan=3, sticky="w")
+        ttk.Radiobutton(
+            mode_frame, text="Einzelkanal", variable=self.kin_mode_var, value="single", command=self._update_kin_mode
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_frame, text="Ratio (Kanal A / Kanal B)", variable=self.kin_mode_var, value="ratio",
+            command=self._update_kin_mode
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(controls, text="Kanal A:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.kin_channel_a_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[0])
+        self.kin_channel_a_combo = ttk.Combobox(
+            controls, textvariable=self.kin_channel_a_var, state="readonly", width=16
+        )
+        self.kin_channel_a_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
+
+        self.kin_channel_b_label = ttk.Label(controls, text="Kanal B (Nenner):")
+        self.kin_channel_b_label.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.kin_channel_b_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[1])
+        self.kin_channel_b_combo = ttk.Combobox(
+            controls, textvariable=self.kin_channel_b_var, state="readonly", width=16
+        )
+        self.kin_channel_b_combo.grid(row=1, column=3, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Bin-Breite (s):").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.kin_bin_width_var = tk.StringVar(value="1.0")
+        ttk.Entry(controls, textvariable=self.kin_bin_width_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.kin_min_signal_var = tk.StringVar(value="1.0")
+        ttk.Entry(controls, textvariable=self.kin_min_signal_var, width=6).grid(row=1, column=7, padx=4, pady=(6, 0))
+
+        ttk.Button(controls, text="Kinetik aktualisieren", command=self._redraw_kinetics).grid(
+            row=1, column=8, padx=(12, 4), pady=(6, 0)
+        )
+
+        ttk.Label(controls, text="Population:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.kin_gate_source_var = tk.StringVar(value=GATE_SOURCE_LIVE)
+        self.kin_gate_source_combo = ttk.Combobox(
+            controls, textvariable=self.kin_gate_source_var, state="readonly", width=24
+        )
+        self.kin_gate_source_combo.grid(row=2, column=1, columnspan=2, padx=4, pady=(6, 0), sticky="w")
+        self.kin_gate_source_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw_kinetics())
+        ttk.Label(
+            controls,
+            text="(eindeutig auswählen, WELCHES gespeicherte Gate-Set gemeint ist — sonst werden "
+            "alle passenden automatisch UND-verknüpft, was bei mehreren sich ausschließenden "
+            "Populationen wie \"Lebend\"/\"Dead\" falsch wäre)",
+            foreground="#555", wraplength=900,
+        ).grid(row=3, column=0, columnspan=9, sticky="w")
+
+        ttk.Button(controls, text="Kinetik dieser Datei exportieren (CSV)", command=self._export_kinetics_csv).grid(
+            row=2, column=4, columnspan=2, padx=(12, 4), pady=(6, 0), sticky="w"
+        )
+        ttk.Button(
+            controls, text="Kinetik ALLER Dateien exportieren (CSV, für Overlays)", command=self._export_all_kinetics_csv
+        ).grid(row=2, column=6, columnspan=3, padx=(4, 4), pady=(6, 0), sticky="w")
+        ttk.Label(
+            controls, text="(\"alle Dateien\"/\"ALLE Dateien\" nutzen die oben gewählte Population für jede Datei)",
+            foreground="#555"
+        ).grid(row=4, column=0, columnspan=9, sticky="w")
+
+        ttk.Button(
+            controls, text="Diesen Plot in Zwischenablage kopieren",
+            command=lambda: self._copy_to_clipboard(self.kin_figure, self.kin_status_var)
+        ).grid(
+            row=5, column=0, columnspan=3, padx=(0, 4), pady=(6, 0), sticky="w"
+        )
+        ttk.Button(
+            controls, text="Alle Kinetik-Plots als PNG exportieren", command=self._export_all_kinetics_png
+        ).grid(row=5, column=3, columnspan=3, padx=(4, 4), pady=(6, 0), sticky="w")
+        ttk.Label(
+            controls, text="(Zwischenablage: direkt mit Strg+V in PowerPoint/Word einfügbar, kein Screenshot nötig)",
+            foreground="#555"
+        ).grid(row=6, column=0, columnspan=9, sticky="w")
+
+        self.kin_figure = Figure(figsize=(8, 6))
+        self.kin_ax = self.kin_figure.add_subplot(111)
+        self.kin_canvas = FigureCanvasTkAgg(self.kin_figure, master=parent)
+        self.kin_canvas.get_tk_widget().pack(fill="both", expand=True)
+        kin_toolbar = NavigationToolbar2Tk(self.kin_canvas, parent, pack_toolbar=False)
+        kin_toolbar.update()
+        kin_toolbar.pack(fill="x")
+
+        self.kin_status_var = tk.StringVar(value="Bereit.")
+        ttk.Label(parent, textvariable=self.kin_status_var, anchor="w").pack(fill="x", padx=4, pady=(0, 4))
+
+        self._update_kin_mode()
+
+    def _update_kin_mode(self):
+        is_ratio = self.kin_mode_var.get() == "ratio"
+        self.kin_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
+        self.kin_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+
+    def _build_stats_tab(self, parent):
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", padx=4, pady=4)
+
+        ttk.Label(controls, text="Quelle:").grid(row=0, column=0, sticky="w")
+        self.stat_mode_var = tk.StringVar(value="ratio")
+        mode_frame = ttk.Frame(controls)
+        mode_frame.grid(row=0, column=1, columnspan=4, sticky="w")
+        ttk.Radiobutton(
+            mode_frame, text="Einzelkanal", variable=self.stat_mode_var, value="single", command=self._update_stat_mode
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_frame, text="Ratio (Kanal A / Kanal B)", variable=self.stat_mode_var, value="ratio",
+            command=self._update_stat_mode
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(controls, text="Kanal A:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.stat_channel_a_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[0])
+        self.stat_channel_a_combo = ttk.Combobox(
+            controls, textvariable=self.stat_channel_a_var, state="readonly", width=16
+        )
+        self.stat_channel_a_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
+
+        self.stat_channel_b_label = ttk.Label(controls, text="Kanal B (Nenner):")
+        self.stat_channel_b_label.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.stat_channel_b_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[1])
+        self.stat_channel_b_combo = ttk.Combobox(
+            controls, textvariable=self.stat_channel_b_var, state="readonly", width=16
+        )
+        self.stat_channel_b_combo.grid(row=1, column=3, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.stat_min_signal_var = tk.StringVar(value="1.0")
+        ttk.Entry(controls, textvariable=self.stat_min_signal_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Schwelle (pos/neg):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.stat_threshold_var = tk.StringVar(value="")
+        ttk.Entry(controls, textvariable=self.stat_threshold_var, width=10).grid(row=2, column=1, padx=4, pady=(6, 0))
+        ttk.Label(controls, text="(oder ins Histogramm klicken)", foreground="#555").grid(
+            row=2, column=2, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        ttk.Button(controls, text="Aktualisieren", command=self._redraw_stats).grid(
+            row=2, column=4, padx=(12, 4), pady=(6, 0)
+        )
+
+        ttk.Label(controls, text="Population:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.stat_gate_source_var = tk.StringVar(value=GATE_SOURCE_LIVE)
+        self.stat_gate_source_combo = ttk.Combobox(
+            controls, textvariable=self.stat_gate_source_var, state="readonly", width=24
+        )
+        self.stat_gate_source_combo.grid(row=3, column=1, columnspan=2, padx=4, pady=(6, 0), sticky="w")
+        self.stat_gate_source_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw_stats())
+        ttk.Label(
+            controls,
+            text="(welches gespeicherte Gate-Set gemeint ist explizit wählen — sonst würden bei mehreren sich "
+            "ausschließenden Populationen wie \"Lebend\"/\"Dead\" alle passenden UND-verknüpft)",
+            foreground="#555", wraplength=900,
+        ).grid(row=4, column=0, columnspan=6, sticky="w")
+
+        body = ttk.PanedWindow(parent, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+
+        plot_frame = ttk.Frame(body)
+        body.add(plot_frame, weight=1)
+        self.stat_figure = Figure(figsize=(6, 5))
+        self.stat_ax = self.stat_figure.add_subplot(111)
+        self.stat_canvas = FigureCanvasTkAgg(self.stat_figure, master=plot_frame)
+        self.stat_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.stat_canvas.mpl_connect("button_press_event", self._on_stat_hist_click)
+        ttk.Button(
+            plot_frame, text="Plot in Zwischenablage kopieren", command=lambda: self._copy_to_clipboard(self.stat_figure)
+        ).pack(anchor="w", pady=(4, 0))
+
+        info_frame = ttk.Frame(body, width=260)
+        body.add(info_frame, weight=0)
+        ttk.Label(info_frame, text="Statistik (aktuelle Datei)", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+        self.stat_info_var = tk.StringVar(value="")
+        ttk.Label(info_frame, textvariable=self.stat_info_var, justify="left").pack(anchor="w", padx=4, pady=4)
+
+        ttk.Separator(info_frame, orient="horizontal").pack(fill="x", padx=4, pady=10)
+        ttk.Label(info_frame, text="Kohorte (alle Dateien)", font=("", 10, "bold")).pack(anchor="w", padx=4)
+        ttk.Label(
+            info_frame, text="nutzt die oben gewählte Population\n(muss ein gespeichertes Gate-Set sein, nicht \"Live\")",
+            foreground="#555", justify="left"
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        ttk.Button(info_frame, text="Kohorte berechnen", command=self._compute_cohort_stats).pack(fill="x", padx=4, pady=2)
+        ttk.Button(info_frame, text="Als CSV exportieren", command=self._export_cohort_csv).pack(fill="x", padx=4, pady=2)
+
+        table_frame = ttk.Frame(parent)
+        table_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        columns = [
+            "filename", "gates_applied", "channel", "n_total", "n_gated", "pct_gated", "n_valid",
+            "threshold", "n_positive", "pct_positive", "n_negative", "pct_negative", "mean", "median",
+        ]
+        self.cohort_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+        for c in columns:
+            self.cohort_tree.heading(c, text=c)
+            self.cohort_tree.column(c, width=90, anchor="center")
+        self.cohort_tree.column("filename", width=220, anchor="w")
+        self.cohort_tree.column("gates_applied", width=140, anchor="w")
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.cohort_tree.yview)
+        self.cohort_tree.configure(yscrollcommand=vsb.set)
+        self.cohort_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.cohort_df: pd.DataFrame | None = None
+        self._update_stat_mode()
+
+    def _update_stat_mode(self):
+        is_ratio = self.stat_mode_var.get() == "ratio"
+        self.stat_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
+        self.stat_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+
+    def _stat_values(self, df: pd.DataFrame) -> tuple[pd.Series, str]:
+        mode = self.stat_mode_var.get()
+        if mode == "single":
+            ch = self.stat_channel_a_var.get()
+            return df[ch], ch
+        ch_a, ch_b = self.stat_channel_a_var.get(), self.stat_channel_b_var.get()
+        try:
+            min_signal = float(self.stat_min_signal_var.get())
+        except ValueError:
+            min_signal = 1.0
+        return compute_ratio(df, ch_a, ch_b, min_signal=min_signal), f"{ch_a}/{ch_b}"
+
+    def _stat_threshold(self) -> float | None:
+        thr_str = self.stat_threshold_var.get().strip()
+        if not thr_str:
+            return None
+        try:
+            return float(thr_str)
+        except ValueError:
+            return None
+
+    def _population_mask(self, df, filename: str, source: str) -> tuple[np.ndarray, str]:
+        """Resolve the 'Population:' selector to a mask. Returns (mask, description)."""
+        if source == GATE_SOURCE_LIVE:
+            return self._cumulative_pending_mask(df), self.gate_tree[self.current_node_id].name
+        if source == GATE_SOURCE_NONE:
+            return np.ones(len(df), dtype=bool), "ungegated"
+        mask, applied = apply_named_gate_set(df, filename, self.existing_gate_sets, source)
+        return mask, (applied[0] if applied else f"{source} (kein Treffer für diese Datei)")
+
+    def _redraw_stats(self):
+        if not self.current_path:
+            return
+        fcs = self._get_data(self.current_path)
+        df = fcs.df
+        mask, pop_desc = self._population_mask(df, fcs.filename, self.stat_gate_source_var.get())
+        gated_df = df[mask]
+        values, label = self._stat_values(gated_df)
+        valid = values.dropna()
+        threshold = self._stat_threshold()
+
+        self.stat_ax.clear()
+        if len(valid):
+            self.stat_ax.hist(valid, bins=100, color="tab:blue", alpha=0.85)
+        if threshold is not None:
+            self.stat_ax.axvline(threshold, color="red", linestyle="--", linewidth=1.5)
+        self.stat_ax.set_xlabel(label)
+        self.stat_ax.set_ylabel("Events")
+        self.stat_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} (Klick in den Plot setzt die Schwelle)")
+        self.stat_canvas.draw_idle()
+
+        stats = value_stats(values, threshold, n_total=len(df), n_gated=len(gated_df))
+        lines = [
+            f"Population: {pop_desc}",
+            f"Kanal/Ratio: {label}",
+            f"Events gesamt: {stats['n_total']}",
+            f"Events gegated: {stats['n_gated']} ({stats['pct_gated']:.1f}%)",
+            f"gültige Werte: {stats['n_valid']}",
+            f"Mean: {stats['mean']:.3g}   Median: {stats['median']:.3g}",
+        ]
+        if threshold is not None:
+            lines += [
+                f"Schwelle: {threshold:.3g}",
+                f"positiv: {stats['n_positive']} ({stats['pct_positive']:.1f}%)",
+                f"negativ: {stats['n_negative']} ({stats['pct_negative']:.1f}%)",
+            ]
+        self.stat_info_var.set("\n".join(lines))
+
+    def _on_stat_hist_click(self, event):
+        if event.inaxes != self.stat_ax or event.xdata is None:
+            return
+        self.stat_threshold_var.set(f"{event.xdata:.4g}")
+        self._redraw_stats()
+
+    def _compute_cohort_stats(self):
+        source = self._require_named_population(self.stat_gate_source_var)
+        if source is None:
+            return
+        threshold = self._stat_threshold()
+        if self.stat_threshold_var.get().strip() and threshold is None:
+            messagebox.showwarning("Ungültige Schwelle", "Schwelle muss eine Zahl sein.")
+            return
+        mode = self.stat_mode_var.get()
+        ch_a = self.stat_channel_a_var.get()
+        ch_b = self.stat_channel_b_var.get() if mode == "ratio" else None
+        try:
+            min_signal = float(self.stat_min_signal_var.get())
+        except ValueError:
+            min_signal = 1.0
+
+        rows = []
+        for path in self.fcs_paths:
+            fcs = self._get_data(path)
+            df = fcs.df
+            mask, applied = self._named_population_mask(df, fcs.filename, source)
+            gated_df = df[mask]
+            if mode == "single":
+                if ch_a not in gated_df.columns:
+                    continue
+                values, label = gated_df[ch_a], ch_a
+            else:
+                if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
+                    continue
+                values = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
+                label = f"{ch_a}/{ch_b}"
+            stats = value_stats(values, threshold, n_total=len(df), n_gated=len(gated_df))
+            row = {"filename": fcs.filename, "gates_applied": ";".join(applied) or "none", "channel": label}
+            row.update(stats)
+            rows.append(row)
+
+        self.cohort_df = pd.DataFrame(rows)
+        self._refresh_cohort_tree()
+        self.status_var.set(f"Kohorten-Statistik für {len(rows)} Dateien berechnet.")
+
+    def _refresh_cohort_tree(self):
+        self.cohort_tree.delete(*self.cohort_tree.get_children())
+        if self.cohort_df is None:
+            return
+        for _, row in self.cohort_df.iterrows():
+            values = []
+            for c in self.cohort_tree["columns"]:
+                v = row.get(c, "")
+                if isinstance(v, float):
+                    v = "" if np.isnan(v) else f"{v:.3g}"
+                values.append(v)
+            self.cohort_tree.insert("", "end", values=values)
+
+    def _export_cohort_csv(self):
+        if self.cohort_df is None or len(self.cohort_df) == 0:
+            messagebox.showwarning("Keine Daten", "Bitte zuerst 'Kohorte berechnen' klicken.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="cohort_stats.csv",
+            initialdir=self._ensure_exports_dir(),
+        )
+        if not path:
+            return
+        self.cohort_df.to_csv(path, index=False)
+        messagebox.showinfo("Exportiert", f"Kohorten-Statistik gespeichert unter:\n{path}")
+
+    # ---------------------------------------------------------- experiment folder
+    def _choose_experiment_folder(self):
+        chosen = filedialog.askdirectory(
+            title="Experiment-Ordner wählen (enthält die .fcs-Dateien, auch in Unterordnern)",
+            initialdir=self.input_dir if os.path.isdir(self.input_dir) else os.getcwd(),
+        )
+        if not chosen:
+            return
+        self._load_experiment(chosen)
+
+    def _load_experiment(self, root_dir: str):
+        """Point the whole app at a new experiment folder: .fcs files are
+        picked up recursively from it, gate-sets are read from/saved to its
+        'gates' subfolder, and exports default into its 'exports' subfolder —
+        so one folder holds everything for one experiment."""
+        try:
+            fcs_paths = find_fcs_files(root_dir, recursive=True)
+        except FileNotFoundError as exc:
+            messagebox.showerror("Keine FCS-Dateien gefunden", str(exc))
+            return
+
+        self._cancel_drawing()
+        self.input_dir = root_dir
+        self.gates_dir = os.path.join(root_dir, "gates")
+        self.exports_dir = os.path.join(root_dir, "exports")
+        self.fcs_paths = fcs_paths
+        self.data_cache.clear()
+        self.existing_gate_sets = load_all_gate_sets(self.gates_dir)
+        self.gate_tree = new_gate_tree()
+        self.current_node_id = "root"
+        self._node_counter = 0
+        self.cohort_df = None
+
+        self.experiment_dir_var.set(self.input_dir)
+        self.file_listbox.delete(0, "end")
+        for p in self.fcs_paths:
+            self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
+        self._refresh_existing_listbox()
+        self._select_file_index(0)
+        self.status_var.set(
+            f"Experiment geladen: {len(self.fcs_paths)} FCS-Datei(en) aus '{root_dir}'. "
+            f"Gates: '{self.gates_dir}', Exporte: '{self.exports_dir}'."
+        )
+
+    # ---------------------------------------------------------- data access
+    def _get_data(self, path: str):
+        if path not in self.data_cache:
+            self.data_cache[path] = load_fcs(path)
+        return self.data_cache[path]
+
+    def _select_file_index(self, idx: int):
+        idx = idx % len(self.fcs_paths)  # wrap around so you can cycle through all files either direction
+        self.file_listbox.selection_clear(0, "end")
+        self.file_listbox.selection_set(idx)
+        self.file_listbox.see(idx)
+        self.current_path = self.fcs_paths[idx]
+        fcs = self._get_data(self.current_path)
+        channels = list(fcs.df.columns)
+        self.x_channel_combo["values"] = channels
+        self.y_channel_combo["values"] = channels
+        if self.x_channel_var.get() not in channels:
+            self.x_channel_var.set(channels[0])
+        if self.y_channel_var.get() not in channels:
+            self.y_channel_var.set(channels[1] if len(channels) > 1 else channels[0])
+        self._update_scope_hint()
+        self._redraw()
+
+        self.kin_channel_a_combo["values"] = channels
+        self.kin_channel_b_combo["values"] = channels
+        if self.kin_channel_a_var.get() not in channels:
+            self.kin_channel_a_var.set(channels[0])
+        if self.kin_channel_b_var.get() not in channels:
+            self.kin_channel_b_var.set(channels[1] if len(channels) > 1 else channels[0])
+
+        self.stat_channel_a_combo["values"] = channels
+        self.stat_channel_b_combo["values"] = channels
+        if self.stat_channel_a_var.get() not in channels:
+            self.stat_channel_a_var.set(channels[0])
+        if self.stat_channel_b_var.get() not in channels:
+            self.stat_channel_b_var.set(channels[1] if len(channels) > 1 else channels[0])
+
+        tab_idx = self.notebook.index(self.notebook.select())
+        if tab_idx == 1:
+            self._redraw_kinetics()
+        elif tab_idx == 2:
+            self._redraw_stats()
+
+    def _on_file_selected(self, _event):
+        sel = self.file_listbox.curselection()
+        if sel:
+            self._cancel_drawing()
+            self._select_file_index(sel[0])
+
+    def _prev_file(self):
+        sel = self.file_listbox.curselection()
+        idx = sel[0] if sel else 0
+        self._cancel_drawing()
+        self._select_file_index(idx - 1)
+
+    def _next_file(self):
+        sel = self.file_listbox.curselection()
+        idx = sel[0] if sel else 0
+        self._cancel_drawing()
+        self._select_file_index(idx + 1)
+
+    def _refresh_existing_listbox(self):
+        self.existing_listbox.delete(0, "end")
+        for gs in self.existing_gate_sets:
+            self.existing_listbox.insert("end", f"{gs.name}  [{gs.scope.get('type')}]")
+        if hasattr(self, "kin_gate_source_combo"):
+            self._refresh_gate_source_combos()
+
+    def _refresh_gate_source_combos(self):
+        """Keep the Kinetik/Statistik 'Population:' dropdowns in sync with the
+        saved gate-sets, so every distinct saved name is pickable explicitly."""
+        values = [GATE_SOURCE_LIVE, GATE_SOURCE_NONE] + list_gate_set_names(self.existing_gate_sets)
+        for combo, var in (
+            (self.kin_gate_source_combo, self.kin_gate_source_var),
+            (self.stat_gate_source_combo, self.stat_gate_source_var),
+        ):
+            combo["values"] = values
+            if var.get() not in values:
+                var.set(values[0])
+
+    # ---------------------------------------------------------- plotting
+    def _base_mask(self, df) -> np.ndarray:
+        """Mask from already-saved gate-sets applicable to the current file (preview only)."""
+        if not self.show_existing_var.get() or not self.current_path:
+            return np.ones(len(df), dtype=bool)
+        filename = os.path.basename(self.current_path)
+        applicable = resolve_gate_sets_for_file(filename, self.existing_gate_sets)
+        mask = np.ones(len(df), dtype=bool)
+        for gs in applicable:
+            mask &= gs.mask(df)
+        return mask
+
+    def _cumulative_pending_mask(self, df) -> np.ndarray:
+        """Mask for the currently viewed node: saved gate-sets (preview) ANDed
+        with every step from the root down to the current node in the tree."""
+        return node_mask(df, self.gate_tree, self.current_node_id, base_mask=self._base_mask(df))
+
+    @staticmethod
+    def _resolve_axis_limits(values: np.ndarray, lo_str: str, hi_str: str) -> tuple[float | None, float | None, bool]:
+        """Parses the Min/Max entry fields for one axis. Returns (lo, hi,
+        manual). manual is False when both fields are empty — meaning
+        matplotlib should autoscale that axis as usual. As soon as either
+        bound is set, manual is True and the missing bound is backfilled from
+        the data's own extent, so outliers on the OTHER side still get
+        clipped/flagged even if only one side was constrained."""
+        lo_str, hi_str = lo_str.strip(), hi_str.strip()
+        try:
+            lo = float(lo_str) if lo_str else None
+        except ValueError:
+            lo = None
+        try:
+            hi = float(hi_str) if hi_str else None
+        except ValueError:
+            hi = None
+        if lo is None and hi is None:
+            return None, None, False
+        finite = values[np.isfinite(values)] if len(values) else values
+        data_lo = float(finite.min()) if len(finite) else 0.0
+        data_hi = float(finite.max()) if len(finite) else 1.0
+        if lo is None:
+            lo = data_lo
+        if hi is None:
+            hi = data_hi
+        if lo >= hi:
+            hi = lo + 1.0
+        return lo, hi, True
+
+    def _autofit_axis_limits(self):
+        """Fill the Min/Max fields from the 1st/99th percentile of the
+        currently displayed population — a one-click fix for the case that
+        prompted this feature: a couple of far-out events (e.g. -10^6) that
+        blow the axis out so badly the real population is squeezed flat."""
+        if not self.current_path:
+            return
+        fcs = self._get_data(self.current_path)
+        df = fcs.df
+        x_ch, y_ch = self.x_channel_var.get(), self.y_channel_var.get()
+        if x_ch not in df.columns or y_ch not in df.columns:
+            return
+        view_mask = self._cumulative_pending_mask(df)
+        x_vals = df[x_ch].to_numpy()[view_mask]
+        y_vals = df[y_ch].to_numpy()[view_mask]
+        if len(x_vals) == 0:
+            return
+        x_lo, x_hi = np.percentile(x_vals, [1, 99])
+        y_lo, y_hi = np.percentile(y_vals, [1, 99])
+        self.x_min_var.set(f"{x_lo:.4g}")
+        self.x_max_var.set(f"{x_hi:.4g}")
+        self.y_min_var.set(f"{y_lo:.4g}")
+        self.y_max_var.set(f"{y_hi:.4g}")
+
+    def _reset_axis_limits(self):
+        for v in (self.x_min_var, self.x_max_var, self.y_min_var, self.y_max_var):
+            v.set("")
+
+    def _redraw(self):
+        if not self.current_path:
+            return
+        fcs = self._get_data(self.current_path)
+        df = fcs.df
+        x_ch, y_ch = self.x_channel_var.get(), self.y_channel_var.get()
+        if x_ch not in df.columns or y_ch not in df.columns:
+            return
+
+        # Drill-down view: only events that passed every already-committed
+        # step (saved gate-sets if enabled, plus every pending step so far)
+        # are shown — cells excluded by an earlier step disappear from later
+        # steps' plots, same as navigating down into a FlowJo gate hierarchy.
+        view_mask = self._cumulative_pending_mask(df)
+        plot_type = self.plot_type_var.get()
+
+        x_raw = df[x_ch].to_numpy(dtype=float)
+        y_raw = df[y_ch].to_numpy(dtype=float)
+
+        # Manual axis limits: clip out-of-range events to the border instead
+        # of letting a couple of far-out events (e.g. -10^6) blow the axis
+        # out and squeeze the real population flat. Clipped events are
+        # tracked (out_of_range) and re-drawn as a red '×' at the border so
+        # their presence stays obvious instead of silently disappearing.
+        x_lo, x_hi, x_manual = self._resolve_axis_limits(x_raw[view_mask], self.x_min_var.get(), self.x_max_var.get())
+        y_lo, y_hi, y_manual = self._resolve_axis_limits(y_raw[view_mask], self.y_min_var.get(), self.y_max_var.get())
+        x_plot = np.clip(x_raw, x_lo, x_hi) if x_manual else x_raw
+        y_plot = np.clip(y_raw, y_lo, y_hi) if y_manual else y_raw
+        x_out = ((x_raw < x_lo) | (x_raw > x_hi)) if x_manual else np.zeros(len(df), dtype=bool)
+        y_out = ((y_raw < y_lo) | (y_raw > y_hi)) if y_manual else np.zeros(len(df), dtype=bool)
+        out_of_range = (x_out | y_out) & view_mask
+
+        hist_range = None
+        if x_manual or y_manual:
+            xr = [x_lo, x_hi] if x_manual else [float(np.min(x_plot[view_mask])), float(np.max(x_plot[view_mask]))]
+            yr = [y_lo, y_hi] if y_manual else [float(np.min(y_plot[view_mask])), float(np.max(y_plot[view_mask]))]
+            hist_range = [xr, yr]
+
+        self.ax.clear()
+        if plot_type == "Scatter":
+            self.ax.scatter(x_plot[view_mask], y_plot[view_mask], s=2, color="tab:blue")
+        elif plot_type == "Histogram":
+            self.ax.hist2d(x_plot[view_mask], y_plot[view_mask], bins=150, cmap="viridis", range=hist_range)
+        elif plot_type == "Density":
+            self._plot_density(self.ax, x_plot[view_mask], y_plot[view_mask], value_range=hist_range)
+        elif plot_type == "Contour":
+            self._plot_contour(self.ax, x_plot[view_mask], y_plot[view_mask], value_range=hist_range)
+
+        self._overlay_child_shapes(self.ax, x_ch, y_ch)
+        self._apply_axis_transforms(x_ch, y_ch)
+        if x_manual:
+            self.ax.set_xlim(x_lo, x_hi)
+        if y_manual:
+            self.ax.set_ylim(y_lo, y_hi)
+        self._overlay_quadrant_preview(self.ax, x_ch, y_ch)
+
+        n_out = int(out_of_range.sum())
+        if n_out:
+            self.ax.scatter(
+                x_plot[out_of_range], y_plot[out_of_range], marker="x", s=45, color="red",
+                linewidths=1.8, zorder=6,
+            )
+
+        self.ax.set_xlabel(x_ch)
+        self.ax.set_ylabel(y_ch)
+        node_name = self.gate_tree[self.current_node_id].name
+        title_pop = f"{node_name}: {int(view_mask.sum())}/{len(df)} Events"
+        if n_out:
+            title_pop += f"  |  {n_out} außerhalb der Achsen-Grenzen (rot ×)"
+        self.ax.set_title(f"{os.path.basename(self.current_path)}\n{title_pop}")
+        self.canvas.draw_idle()
+        self._update_breadcrumb()
+        self._refresh_gate_tree_view(df)
+
+    @staticmethod
+    def _hist2d_grid(x, y, bins=150, value_range=None):
+        H, xedges, yedges = np.histogram2d(x, y, bins=bins, range=value_range)
+        return H, xedges, yedges
+
+    def _plot_density(self, ax, x, y, bins=150, sigma=1.5, value_range=None):
+        H, xedges, yedges = self._hist2d_grid(x, y, bins=bins, value_range=value_range)
+        Hs = gaussian_filter(H, sigma=sigma)
+        ax.pcolormesh(xedges, yedges, Hs.T, cmap="viridis", shading="auto")
+
+    def _plot_contour(self, ax, x, y, bins=150, sigma=1.5, levels=12, value_range=None):
+        H, xedges, yedges = self._hist2d_grid(x, y, bins=bins, value_range=value_range)
+        Hs = gaussian_filter(H, sigma=sigma)
+        xc = (xedges[:-1] + xedges[1:]) / 2
+        yc = (yedges[:-1] + yedges[1:]) / 2
+        ax.contourf(xc, yc, Hs.T, levels=levels, cmap="viridis")
+        ax.contour(xc, yc, Hs.T, levels=levels, colors="k", linewidths=0.3, alpha=0.5)
+
+    def _channel_range(self, channel: str) -> float:
+        fcs = self._get_data(self.current_path)
+        r = (fcs.channel_ranges or {}).get(channel)
+        if r:
+            return r
+        col = fcs.df[channel]
+        return float(col.max()) if len(col) else 262144.0
+
+    def _apply_axis_transforms(self, x_ch: str, y_ch: str):
+        try:
+            linthresh = float(self.log_linthresh_var.get())
+        except ValueError:
+            linthresh = 10.0
+        try:
+            logicle_w = float(self.logicle_w_var.get())
+        except ValueError:
+            logicle_w = 0.5
+        try:
+            logicle_m = float(self.logicle_m_var.get())
+        except ValueError:
+            logicle_m = 4.5
+
+        apply_axis_scale(
+            self.ax, "x", self.x_transform_var.get(),
+            channel_range=self._channel_range(x_ch), log_linthresh=linthresh,
+            logicle_w=logicle_w, logicle_m=logicle_m,
+        )
+        apply_axis_scale(
+            self.ax, "y", self.y_transform_var.get(),
+            channel_range=self._channel_range(y_ch), log_linthresh=linthresh,
+            logicle_w=logicle_w, logicle_m=logicle_m,
+        )
+
+    @staticmethod
+    def _shape_patch(step: GateStep, **kwargs):
+        if step.shape in ("polygon", "rectangle"):
+            return PolygonPatch(step.vertices, closed=True, fill=False, **kwargs)
+        if step.shape == "ellipse":
+            p = step.params
+            return EllipsePatch((p["cx"], p["cy"]), width=2 * p["rx"], height=2 * p["ry"], fill=False, **kwargs)
+        return None
+
+    @staticmethod
+    def _draw_quadrant_lines(ax, cx: float, cy: float, angle_deg: float, **kwargs):
+        """Draw the two perpendicular dividing lines of a quadrant gate,
+        crossing at (cx, cy) and rotated by angle_deg. Drawn far beyond the
+        current view and clipped to it (matplotlib's default clip-on-axes
+        behavior for line artists) so the lines always look like they span
+        the whole plot; scalex/scaley=False keeps them from affecting
+        autoscale/the current view themselves."""
+        angle = math.radians(angle_deg)
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        span = math.hypot(xlim[1] - xlim[0], ylim[1] - ylim[0]) * 2 + 1e-9
+        kwargs.setdefault("linewidth", 1.5)
+        for dx, dy in ((math.sin(angle), -math.cos(angle)), (math.cos(angle), math.sin(angle))):
+            ax.plot(
+                [cx - dx * span, cx + dx * span], [cy - dy * span, cy + dy * span],
+                scalex=False, scaley=False, **kwargs,
+            )
+
+    @staticmethod
+    def _quadrant_label_position(ax, params: dict) -> tuple[float, float]:
+        """Approximate label position inside the given quadrant: offset from
+        the center towards that quadrant, normalized by the current axis
+        span per-axis so it lands sensibly even when X and Y have very
+        different raw ranges (this is only for label placement, not gate
+        math — the gate boundary itself always rotates in raw data units)."""
+        cx, cy = params["cx"], params["cy"]
+        angle = math.radians(params.get("angle_deg", 0.0))
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        x_span, y_span = (xlim[1] - xlim[0]) or 1.0, (ylim[1] - ylim[0]) or 1.0
+        x_sign = 1.0 if params["x_sign"] == "+" else -1.0
+        y_sign = 1.0 if params["y_sign"] == "+" else -1.0
+        frac = 0.22
+        off_x = x_sign * frac * math.cos(angle) - y_sign * frac * math.sin(angle)
+        off_y = x_sign * frac * math.sin(angle) + y_sign * frac * math.cos(angle)
+        return cx + off_x * x_span, cy + off_y * y_span
+
+    def _overlay_child_shapes(self, ax, x_ch: str, y_ch: str):
+        """Draw outlines of the current node's child gates that use this exact
+        channel pair, as a visual reference on top of any plot type — also
+        what you double-click on to navigate into that child population."""
+        drawn_quadrant_centers = set()
+        for child_id in self.gate_tree[self.current_node_id].children:
+            step = self.gate_tree[child_id].step
+            if step.x_channel != x_ch or step.y_channel != y_ch:
+                continue
+            if step.shape == "quadrant":
+                p = step.params
+                key = (p["cx"], p["cy"], p.get("angle_deg", 0.0))
+                if key not in drawn_quadrant_centers:
+                    drawn_quadrant_centers.add(key)
+                    self._draw_quadrant_lines(ax, p["cx"], p["cy"], p.get("angle_deg", 0.0), color="red")
+                cx, cy = self._quadrant_label_position(ax, p)
+                ax.annotate(self.gate_tree[child_id].name, (cx, cy), color="red", ha="center", fontsize=8)
+                continue
+            patch = self._shape_patch(step, edgecolor="red", linewidth=1.5)
+            if patch is None:
+                continue
+            ax.add_patch(patch)
+            if step.shape == "ellipse":
+                cx, cy = step.params["cx"], step.params["cy"]
+            else:
+                cx, cy = patch.get_path().vertices.mean(axis=0)
+            ax.annotate(self.gate_tree[child_id].name, (cx, cy), color="red", ha="center", fontsize=8)
+
+    def _overlay_quadrant_preview(self, ax, x_ch: str, y_ch: str):
+        """While a quadrant gate is being placed: once its center is picked,
+        keep showing the (dashed, orange) preview crosshair across redraws
+        until 'Schritt übernehmen'/'Abbrechen' is clicked."""
+        coords = self.pending_shape_coords
+        if not coords or coords.get("shape") not in QUADRANT_SHAPES:
+            return
+        center = coords.get("center")
+        if center is None or coords["x_channel"] != x_ch or coords["y_channel"] != y_ch:
+            return
+        angle_deg = self._quadrant_angle_value() if coords["shape"] == "Quadrant (Winkel)" else 0.0
+        self._draw_quadrant_lines(ax, center[0], center[1], angle_deg, color="orange", linestyle="--", linewidth=1.5)
+
+    def _update_breadcrumb(self):
+        path = node_path(self.gate_tree, self.current_node_id)
+        self.breadcrumb_var.set(" › ".join(self.gate_tree[nid].name for nid in path))
+
+    def _gate_tree_counts(self, df) -> dict[str, tuple[int, float]]:
+        """DFS over the WHOLE tree (not just the current node's lineage),
+        returning {node_id: (n_events, pct_of_parent)} so the tree panel can
+        show every gate's size at a glance without navigating to it."""
+        base_mask = self._base_mask(df)
+        counts: dict[str, tuple[int, float]] = {}
+
+        def walk(node_id: str, parent_mask: np.ndarray, parent_total: int):
+            node = self.gate_tree[node_id]
+            mask = parent_mask if node.step is None else (parent_mask & node.step.mask(df))
+            n = int(mask.sum())
+            pct = (100.0 * n / parent_total) if parent_total else 0.0
+            counts[node_id] = (n, pct)
+            for child_id in node.children:
+                walk(child_id, mask, n)
+
+        walk("root", base_mask, len(df))
+        return counts
+
+    def _refresh_gate_tree_view(self, df):
+        """Rebuild the hierarchy tree panel: every gate, indented under its
+        parent (ttk.Treeview nests children visually), with the currently
+        viewed node highlighted — so the whole gating scheme is visible at
+        once instead of only the current level's siblings."""
+        tv = self.tree_view
+
+        open_state: dict[str, bool] = {}
+
+        def collect_open(node_id: str):
+            if tv.exists(node_id):
+                open_state[node_id] = bool(tv.item(node_id, "open"))
+            for child_id in self.gate_tree[node_id].children:
+                collect_open(child_id)
+
+        collect_open("root")
+        tv.delete(*tv.get_children(""))
+
+        counts = self._gate_tree_counts(df)
+        path_to_current = set(node_path(self.gate_tree, self.current_node_id))
+
+        def insert_node(parent_iid: str, node_id: str):
+            node = self.gate_tree[node_id]
+            n, pct = counts.get(node_id, (0, 0.0))
+            label = str(n) if node_id == "root" else f"{n} ({pct:.1f}%)"
+            is_open = open_state.get(node_id, node_id in path_to_current)
+            tags = ("current",) if node_id == self.current_node_id else ()
+            tv.insert(parent_iid, "end", iid=node_id, text=node.name, values=(label,), open=is_open, tags=tags)
+            for child_id in node.children:
+                insert_node(node_id, child_id)
+
+        insert_node("", "root")
+        tv.selection_set(self.current_node_id)
+        tv.see(self.current_node_id)
+
+    def _on_tree_double_click(self, event):
+        row_id = self.tree_view.identify_row(event.y)
+        if row_id:
+            self._navigate_to(row_id)
+
+    def _tree_selected_node_id(self) -> str | None:
+        sel = self.tree_view.selection()
+        return sel[0] if sel else None
+
+    def _navigate_selected_tree_node(self):
+        node_id = self._tree_selected_node_id()
+        if node_id is None:
+            messagebox.showinfo("Kein Knoten ausgewählt", "Bitte zuerst einen Knoten im Gate-Baum auswählen.")
+            return
+        self._navigate_to(node_id)
+
+    def _rename_tree_selected(self):
+        node_id = self._tree_selected_node_id()
+        if node_id is None:
+            messagebox.showinfo("Kein Knoten ausgewählt", "Bitte zuerst einen Knoten im Gate-Baum auswählen.")
+            return
+        if node_id == "root":
+            messagebox.showinfo("Wurzel", "Die Wurzel-Ebene (alle Events) kann nicht umbenannt werden.")
+            return
+        self._rename_node(node_id)
+
+    def _edit_tree_selected(self):
+        node_id = self._tree_selected_node_id()
+        if node_id is None:
+            messagebox.showinfo("Kein Knoten ausgewählt", "Bitte zuerst einen Knoten im Gate-Baum auswählen.")
+            return
+        if node_id == "root":
+            messagebox.showinfo("Wurzel", "Die Wurzel-Ebene hat kein Gate zum Bearbeiten.")
+            return
+        parent_id = self.gate_tree[node_id].parent_id
+        if self.current_node_id != parent_id:
+            self._navigate_to(parent_id)
+        self._start_editing_node(node_id)
+
+    def _delete_tree_selected(self):
+        node_id = self._tree_selected_node_id()
+        if node_id is None:
+            messagebox.showinfo("Kein Knoten ausgewählt", "Bitte zuerst einen Knoten im Gate-Baum auswählen.")
+            return
+        if node_id == "root":
+            messagebox.showinfo("Wurzel", "Die Wurzel-Ebene (alle Events) kann nicht gelöscht werden.")
+            return
+        node = self.gate_tree[node_id]
+        if node.children and not messagebox.askyesno(
+            "Unter-Gates löschen?", f"'{node.name}' hat {len(node.children)} Unter-Gate(s). Wirklich mit löschen?"
+        ):
+            return
+        need_navigate_up = node_id in node_path(self.gate_tree, self.current_node_id)
+        parent_id = node.parent_id
+        self._cancel_drawing()
+        remove_subtree(self.gate_tree, node_id)
+        if need_navigate_up:
+            self._navigate_to(parent_id)
+        else:
+            self._redraw()
+
+    # ---------------------------------------------------------- tree navigation
+    def _navigate_to(self, node_id: str):
+        self._cancel_drawing()
+        self.current_node_id = node_id
+        self._redraw()
+
+    def _on_canvas_click(self, event):
+        if self._picking_point_center:
+            self._on_quadrant_center_click(event)
+            return
+        if self.active_selector is not None:
+            return
+
+        # Right-click on the X/Y axis label: show a popup menu to switch channel.
+        if event.button == 3 and event.guiEvent is not None:
+            renderer = self.canvas.get_renderer()
+            try:
+                if self.ax.xaxis.label.get_window_extent(renderer).contains(event.x, event.y):
+                    self._show_channel_menu(event.guiEvent, self.x_channel_var)
+                    return
+                if self.ax.yaxis.label.get_window_extent(renderer).contains(event.x, event.y):
+                    self._show_channel_menu(event.guiEvent, self.y_channel_var)
+                    return
+            except Exception:
+                pass
+            return
+
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        x_ch, y_ch = self.x_channel_var.get(), self.y_channel_var.get()
+
+        # Double-click INSIDE a child gate's shape: navigate into it.
+        if event.dblclick:
+            for child_id in self.gate_tree[self.current_node_id].children:
+                step = self.gate_tree[child_id].step
+                if step.x_channel == x_ch and step.y_channel == y_ch and point_in_step(step, event.xdata, event.ydata):
+                    self._navigate_to(child_id)
+                    return
+            return
+
+        # Single click ON a child gate's outline (not its interior): reshape it.
+        hit_id = self._find_child_on_line(x_ch, y_ch, event)
+        if hit_id is not None:
+            self._start_editing_node(hit_id)
+
+    def _shape_boundary_points(self, step: GateStep) -> np.ndarray:
+        if step.shape in ("polygon", "rectangle"):
+            pts = np.array(step.vertices, dtype=float)
+            return np.vstack([pts, pts[:1]])
+        if step.shape == "ellipse":
+            p = step.params
+            t = np.linspace(0, 2 * np.pi, 128)
+            return np.column_stack([p["cx"] + p["rx"] * np.cos(t), p["cy"] + p["ry"] * np.sin(t)])
+        return np.empty((0, 2))
+
+    @staticmethod
+    def _point_to_polyline_distance_px(points_disp: np.ndarray, px: float, py: float) -> float:
+        if len(points_disp) < 2:
+            return float("inf")
+        a, b = points_disp[:-1], points_disp[1:]
+        ab = b - a
+        ab_len2 = np.sum(ab**2, axis=1)
+        ab_len2[ab_len2 == 0] = 1e-9
+        p = np.array([px, py])
+        t = np.clip(np.sum((p - a) * ab, axis=1) / ab_len2, 0, 1)
+        proj = a + ab * t[:, None]
+        return float(np.min(np.sqrt(np.sum((p - proj) ** 2, axis=1))))
+
+    def _find_child_on_line(self, x_ch: str, y_ch: str, event, tolerance_px: float = 8.0) -> str | None:
+        best_id, best_dist = None, tolerance_px
+        for child_id in self.gate_tree[self.current_node_id].children:
+            step = self.gate_tree[child_id].step
+            if step.x_channel != x_ch or step.y_channel != y_ch:
+                continue
+            boundary = self._shape_boundary_points(step)
+            if len(boundary) == 0:
+                continue
+            disp = self.ax.transData.transform(boundary)
+            dist = self._point_to_polyline_distance_px(disp, event.x, event.y)
+            if dist < best_dist:
+                best_dist, best_id = dist, child_id
+        return best_id
+
+    def _show_channel_menu(self, gui_event, channel_var: tk.StringVar):
+        fcs = self._get_data(self.current_path)
+        menu = tk.Menu(self, tearoff=0)
+        for ch in fcs.df.columns:
+            menu.add_command(label=ch, command=lambda c=ch: self._set_channel_and_redraw(channel_var, c))
+        try:
+            menu.tk_popup(gui_event.x_root, gui_event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _set_channel_and_redraw(self, channel_var: tk.StringVar, channel: str):
+        channel_var.set(channel)
+        self._redraw()
+
+    def _rename_node(self, node_id: str):
+        node = self.gate_tree[node_id]
+        new_name = simpledialog.askstring("Gate umbenennen", "Neuer Name:", initialvalue=node.name, parent=self)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning("Name fehlt", "Der Name darf nicht leer sein.")
+            return
+        node.name = new_name
+        self._redraw()
+
+    def _start_editing_node(self, node_id: str):
+        """Reshape an existing gate in place: preload the selector with its
+        current vertices/extents so only the shape changes — node id, name
+        and children are left untouched, so they keep matching across files."""
+        if self.active_selector is not None or node_id == "root":
+            return
+        node = self.gate_tree[node_id]
+        step = node.step
+        if step.shape == "quadrant":
+            messagebox.showinfo(
+                "Nicht unterstützt",
+                "Quadranten-Gates können nicht per Ecken-Editor angepasst werden. Bitte löschen und neu zeichnen."
+            )
+            return
+        shape_label = step.shape.capitalize()
+        if shape_label not in SHAPES:
+            return
+
+        self.x_channel_var.set(step.x_channel)
+        self.y_channel_var.set(step.y_channel)
+        self.shape_var.set(shape_label)
+        self._redraw()  # current_node_id (the parent) is unchanged, just refresh for the channel pair
+
+        self.editing_node_id = node_id
+        self.pending_shape_coords = {"x_channel": step.x_channel, "y_channel": step.y_channel, "shape": shape_label}
+
+        if shape_label == "Polygon":
+            self.active_selector = PolygonSelector(self.ax, onselect=lambda verts: None, useblit=True)
+            self.active_selector.verts = [list(v) for v in step.vertices]
+        elif shape_label == "Rectangle":
+            xs = [v[0] for v in step.vertices]
+            ys = [v[1] for v in step.vertices]
+            self.active_selector = RectangleSelector(self.ax, onselect=lambda e1, e2: None, useblit=True, interactive=True)
+            self.active_selector.extents = (min(xs), max(xs), min(ys), max(ys))
+        elif shape_label == "Ellipse":
+            p = step.params
+            self.active_selector = EllipseSelector(self.ax, onselect=lambda e1, e2: None, useblit=True, interactive=True)
+            self.active_selector.extents = (p["cx"] - p["rx"], p["cx"] + p["rx"], p["cy"] - p["ry"], p["cy"] + p["ry"])
+
+        self.x_channel_combo.configure(state="disabled")
+        self.y_channel_combo.configure(state="disabled")
+        self.shape_combo.configure(state="disabled")
+        self.draw_button.configure(state="disabled")
+        self.finish_button.configure(state="normal", text="Änderungen speichern")
+        self.cancel_button.configure(state="normal")
+        self.status_var.set(
+            f"Gate '{node.name}' wird bearbeitet — Ecken/Ränder anpassen, dann 'Änderungen speichern' klicken. "
+            "Name und Kind-Gates bleiben dabei erhalten."
+        )
+
+    def _go_to_parent(self):
+        parent_id = self.gate_tree[self.current_node_id].parent_id
+        if parent_id is None:
+            return
+        self._navigate_to(parent_id)
+
+    def _reset_tree(self):
+        if not messagebox.askyesno("Baum zurücksetzen?", "Wirklich den gesamten Gate-Baum verwerfen?"):
+            return
+        self._cancel_drawing()
+        self.gate_tree = new_gate_tree()
+        self.current_node_id = "root"
+        self._node_counter = 0
+        self._redraw()
+
+    # ---------------------------------------------------------- drawing
+    def _quadrant_angle_value(self) -> float:
+        try:
+            return float(self.quadrant_angle_var.get())
+        except ValueError:
+            return 0.0
+
+    def _start_drawing(self):
+        if self.active_selector is not None or self._picking_point_center:
+            return
+        self.editing_node_id = None
+        self.finish_button.configure(text="Schritt übernehmen")
+        fcs = self._get_data(self.current_path)
+        df = fcs.df
+        shape = self.shape_var.get()
+        self.pending_shape_coords = {
+            "x_channel": self.x_channel_var.get(),
+            "y_channel": self.y_channel_var.get(),
+            "shape": shape,
+        }
+
+        if shape == "Polygon":
+            self.active_selector = PolygonSelector(self.ax, onselect=lambda verts: None, useblit=True)
+        elif shape == "Rectangle":
+            self.active_selector = RectangleSelector(
+                self.ax, onselect=lambda e1, e2: None, useblit=True, interactive=True
+            )
+        elif shape == "Ellipse":
+            self.active_selector = EllipseSelector(
+                self.ax, onselect=lambda e1, e2: None, useblit=True, interactive=True
+            )
+        elif shape in QUADRANT_SHAPES:
+            self.pending_shape_coords["center"] = None
+            self._picking_point_center = True
+            self.canvas.get_tk_widget().configure(cursor="crosshair")
+
+        self.x_channel_combo.configure(state="disabled")
+        self.y_channel_combo.configure(state="disabled")
+        self.shape_combo.configure(state="disabled")
+        self.draw_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+        if shape in QUADRANT_SHAPES:
+            self.finish_button.configure(state="disabled")
+            self.status_var.set(
+                "Quadranten-Gate: Klicke auf den Kreuzungspunkt der beiden Trennlinien "
+                "(erzeugt 4 Kind-Gates, eines je Quadrant)."
+            )
+        else:
+            self.finish_button.configure(state="normal")
+            self.status_var.set(
+                f"{shape}-Gate: "
+                + (
+                    "Punkte anklicken, letzten Punkt doppelklicken zum Schließen."
+                    if shape == "Polygon"
+                    else "Ziehen zum Aufziehen der Form, danach Ecken/Ränder nachziehbar."
+                )
+                + " Dann 'Schritt übernehmen' klicken."
+            )
+
+    def _on_quadrant_center_click(self, event):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        self.pending_shape_coords["center"] = (float(event.xdata), float(event.ydata))
+        self._picking_point_center = False
+        self.canvas.get_tk_widget().configure(cursor="")
+        self.finish_button.configure(state="normal")
+        self._redraw()
+        self.status_var.set(
+            f"Mittelpunkt bei ({event.xdata:.4g}, {event.ydata:.4g}) gesetzt — 'Schritt übernehmen' legt die "
+            "4 Quadranten-Gates an. Erneut klicken verschiebt den Mittelpunkt."
+        )
+
+    def _finish_quadrant_step(self):
+        coords = self.pending_shape_coords
+        center = coords.get("center") if coords else None
+        if center is None:
+            messagebox.showerror(
+                "Kein Mittelpunkt gesetzt", "Bitte zuerst auf den Kreuzungspunkt des Quadranten-Gates klicken."
+            )
+            return
+        x_ch, y_ch = coords["x_channel"], coords["y_channel"]
+        angle_deg = self._quadrant_angle_value() if coords["shape"] == "Quadrant (Winkel)" else 0.0
+        cx, cy = center
+
+        created_names = []
+        for x_sign, y_sign in (("-", "-"), ("+", "-"), ("-", "+"), ("+", "+")):
+            step = GateStep(
+                x_channel=x_ch, y_channel=y_ch, shape="quadrant",
+                params={"cx": cx, "cy": cy, "angle_deg": angle_deg, "x_sign": x_sign, "y_sign": y_sign},
+            )
+            node_id = f"node_{self._node_counter}"
+            self._node_counter += 1
+            name = f"{x_ch}{x_sign}/{y_ch}{y_sign}"
+            add_child_node(self.gate_tree, self.current_node_id, step, name, node_id)
+            created_names.append(name)
+
+        self._teardown_selector()
+        self._redraw()
+        self.status_var.set(
+            f"4 Quadranten-Gates hinzugefügt ({', '.join(created_names)}). Umbenennen über den Gate-Baum rechts."
+        )
+
+    def _finish_step(self):
+        if self.pending_shape_coords and self.pending_shape_coords.get("shape") in QUADRANT_SHAPES:
+            self._finish_quadrant_step()
+            return
+        if self.active_selector is None:
+            return
+        shape = self.pending_shape_coords["shape"]
+        x_ch = self.pending_shape_coords["x_channel"]
+        y_ch = self.pending_shape_coords["y_channel"]
+
+        try:
+            if shape == "Polygon":
+                verts = [[float(vx), float(vy)] for vx, vy in self.active_selector.verts]
+                if len(verts) < 3:
+                    raise ValueError("Polygon braucht mindestens 3 Punkte.")
+                step = GateStep(x_channel=x_ch, y_channel=y_ch, shape="polygon", vertices=verts)
+            elif shape == "Rectangle":
+                xmin, xmax, ymin, ymax = self.active_selector.extents
+                if xmin == xmax or ymin == ymax:
+                    raise ValueError("Rechteck hat keine Fläche.")
+                verts = [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]]
+                step = GateStep(x_channel=x_ch, y_channel=y_ch, shape="rectangle", vertices=verts)
+            elif shape == "Ellipse":
+                xmin, xmax, ymin, ymax = self.active_selector.extents
+                if xmin == xmax or ymin == ymax:
+                    raise ValueError("Ellipse hat keine Fläche.")
+                params = {
+                    "cx": (xmin + xmax) / 2,
+                    "cy": (ymin + ymax) / 2,
+                    "rx": (xmax - xmin) / 2,
+                    "ry": (ymax - ymin) / 2,
+                }
+                step = GateStep(x_channel=x_ch, y_channel=y_ch, shape="ellipse", params=params)
+            else:
+                raise ValueError(f"Unbekannte Form: {shape}")
+        except Exception as exc:
+            messagebox.showerror("Gate unvollständig", str(exc))
+            return
+
+        if self.editing_node_id is not None:
+            node = self.gate_tree[self.editing_node_id]
+            node.step = step  # node id, name and children stay exactly as they were
+            message = f"Gate '{node.name}' aktualisiert — Name und Kind-Gates bleiben erhalten."
+            self.editing_node_id = None
+        else:
+            # Default name is just the axis pair — matches what you'll actually
+            # remember this gate by. The rename prompt (defaulting to that
+            # name) opens right away so you can commit a real name in one go;
+            # Cancel/closing it just keeps the axis-pair default.
+            default_name = f"{x_ch} / {y_ch}"
+            node_id = f"node_{self._node_counter}"
+            self._node_counter += 1
+            add_child_node(self.gate_tree, self.current_node_id, step, default_name, node_id)
+            self._teardown_selector()
+            self._redraw()
+            self._rename_node(node_id)
+            self.status_var.set(
+                f"Kind-Gate '{self.gate_tree[node_id].name}' hinzugefügt (Ansicht bleibt auf der aktuellen Ebene — "
+                "so lassen sich weitere Geschwister-Gates zeichnen). Doppelklick ins Gate wechselt in diese "
+                "Population."
+            )
+            return
+
+        self._teardown_selector()
+        self._redraw()
+        self.status_var.set(message)
+
+    def _cancel_drawing(self):
+        was_drawing = self.active_selector is not None or self._picking_point_center or self.pending_shape_coords is not None
+        if was_drawing:
+            self._teardown_selector()
+            self._redraw()
+            self.status_var.set("Zeichnen abgebrochen.")
+
+    def _teardown_selector(self):
+        if self.active_selector is not None:
+            self.active_selector.set_active(False)
+            self.active_selector.disconnect_events()
+            self.active_selector = None
+        self._picking_point_center = False
+        self.canvas.get_tk_widget().configure(cursor="")
+        self.pending_shape_coords = None
+        self.editing_node_id = None
+        self.x_channel_combo.configure(state="readonly")
+        self.y_channel_combo.configure(state="readonly")
+        self.shape_combo.configure(state="readonly")
+        self.draw_button.configure(state="normal")
+        self.finish_button.configure(state="disabled", text="Schritt übernehmen")
+        self.cancel_button.configure(state="disabled")
+
+    # ---------------------------------------------------------- scope / save
+    def _update_scope_hint(self):
+        scope = self.scope_var.get()
+        if scope == "all":
+            self.scope_hint_var.set("Gilt für ALLE Dateien im Ordner.")
+        elif scope == "group":
+            self.scope_hint_var.set(
+                f'Gilt für alle Dateien, deren Name "{self.pattern_var.get() or "<Pattern>"}" enthält.'
+            )
+        elif scope == "file" and self.current_path:
+            self.scope_hint_var.set(f"Gilt NUR für: {os.path.basename(self.current_path)}")
+
+    def _save_gate_set(self):
+        steps = node_steps(self.gate_tree, self.current_node_id)
+        if not steps:
+            messagebox.showwarning(
+                "Keine Schritte",
+                "Die aktuelle Ansicht ist die Wurzel (keine Gates). Bitte zuerst einen Gate-Schritt zeichnen "
+                "und/oder per Doppelklick in die gewünschte Population navigieren."
+            )
+            return
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Name fehlt", "Bitte einen Namen für das Gate-Set eingeben.")
+            return
+
+        scope_type = self.scope_var.get()
+        scope = {"type": scope_type}
+        if scope_type == "group":
+            pattern = self.pattern_var.get().strip()
+            if not pattern:
+                messagebox.showwarning("Pattern fehlt", "Bitte ein Pattern für scope=group eingeben.")
+                return
+            scope["pattern"] = pattern
+        elif scope_type == "file":
+            scope["filename"] = os.path.basename(self.current_path)
+
+        gate_set = GateSet(name=name, scope=scope, steps=steps)
+        out_path = save_gate_set(gate_set, self.gates_dir)
+
+        self.existing_gate_sets = load_all_gate_sets(self.gates_dir)
+        self._refresh_existing_listbox()
+        messagebox.showinfo(
+            "Gespeichert",
+            f"Gate-Set '{name}' gespeichert unter:\n{out_path}\n\n"
+            f"({len(steps)} Schritt(e) auf dem Pfad Wurzel → '{self.gate_tree[self.current_node_id].name}')"
+        )
+
+    # ---------------------------------------------------------- kinetics tab
+    def _redraw_kinetics(self):
+        if not self.current_path:
+            return
+        fcs = self._get_data(self.current_path)
+        df = fcs.df
+
+        try:
+            bin_width = float(self.kin_bin_width_var.get())
+            min_signal = float(self.kin_min_signal_var.get())
+        except ValueError:
+            self.kin_status_var.set("Bin-Breite / Min. Signal müssen Zahlen sein.")
+            return
+
+        mask, pop_desc = self._population_mask(df, fcs.filename, self.kin_gate_source_var.get())
+        gated_df = df[mask]
+
+        mode = self.kin_mode_var.get()
+        if mode == "single":
+            channel = self.kin_channel_a_var.get()
+            if channel not in gated_df.columns:
+                return
+            value = gated_df[channel]
+            ylabel = channel
+        else:
+            ch_a, ch_b = self.kin_channel_a_var.get(), self.kin_channel_b_var.get()
+            if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
+                return
+            value = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
+            ylabel = f"Ratio {ch_a} / {ch_b}"
+
+        binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
+
+        self.kin_ax.clear()
+        if len(binned):
+            self.kin_ax.errorbar(
+                binned["time_bin_start_s"], binned["median_ratio"], yerr=binned["sem_ratio"],
+                fmt="-o", markersize=3, linewidth=1, capsize=2,
+            )
+            baseline_end_s = parse_baseline_duration_s(fcs.filename)
+            if baseline_end_s is not None:
+                self.kin_ax.axvline(
+                    baseline_end_s, color="red", linestyle="--", linewidth=1,
+                    label=f"Stimulus ({baseline_end_s:.0f}s)"
+                )
+                self.kin_ax.legend()
+        self.kin_ax.set_xlabel("Zeit (s)")
+        self.kin_ax.set_ylabel(f"{ylabel} (Median pro Bin)")
+        self.kin_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events")
+        self.kin_canvas.draw_idle()
+
+        n_bins = len(binned)
+        self.kin_status_var.set(
+            f"Population: {pop_desc} — {n_bins} Zeit-Bins, "
+            f"{int(value.notna().sum()) if mode == 'ratio' else len(value)} Events mit gültigem Wert."
+        )
+
+        self._kin_last_binned = binned
+        self._kin_last_label = ylabel
+        self._kin_last_filename = fcs.filename
+        self._kin_last_population = pop_desc
+
+    def _export_kinetics_csv(self):
+        binned = getattr(self, "_kin_last_binned", None)
+        if binned is None or len(binned) == 0:
+            messagebox.showwarning("Keine Daten", "Bitte zuerst die Kinetik berechnen (Tab anzeigen/aktualisieren).")
+            return
+        stem = os.path.splitext(self._kin_last_filename)[0]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"{stem}_kinetics.csv",
+            initialdir=self._ensure_exports_dir(),
+        )
+        if not path:
+            return
+        out = binned.copy()
+        out.insert(0, "filename", self._kin_last_filename)
+        out.insert(1, "population", self._kin_last_population)
+        out.insert(2, "channel", self._kin_last_label)
+        out.to_csv(path, index=False)
+        messagebox.showinfo(
+            "Exportiert", f"Kinetik gespeichert unter:\n{path}\n\n(Population: {self._kin_last_population})"
+        )
+
+    def _require_named_population(self, gate_source_var: tk.StringVar) -> str | None:
+        """Guard for the 'all files' batch exports / cohort computation: the
+        Live Gating-tab preview only applies to the currently selected file,
+        so batch operations need an explicit saved gate-set name (or
+        'ungegated') instead."""
+        source = gate_source_var.get()
+        if source == GATE_SOURCE_LIVE:
+            messagebox.showwarning(
+                "Population nicht geeignet",
+                "\"Live (Gating-Tab-Ansicht)\" gilt nur für die aktuell gewählte Datei und kann nicht auf alle "
+                "Dateien angewendet werden. Bitte zuerst ein gespeichertes Gate-Set (oder \"Ungegated\") als "
+                "Population auswählen."
+            )
+            return None
+        return source
+
+    def _named_population_mask(self, df, filename: str, source: str) -> tuple[np.ndarray, list[str]]:
+        if source == GATE_SOURCE_NONE:
+            return np.ones(len(df), dtype=bool), []
+        return apply_named_gate_set(df, filename, self.existing_gate_sets, source)
+
+    def _export_all_kinetics_csv(self):
+        source = self._require_named_population(self.kin_gate_source_var)
+        if source is None:
+            return
+        mode = self.kin_mode_var.get()
+        ch_a = self.kin_channel_a_var.get()
+        ch_b = self.kin_channel_b_var.get() if mode == "ratio" else None
+        try:
+            bin_width = float(self.kin_bin_width_var.get())
+            min_signal = float(self.kin_min_signal_var.get())
+        except ValueError:
+            messagebox.showwarning("Ungültige Eingabe", "Bin-Breite / Min. Signal müssen Zahlen sein.")
+            return
+
+        rows = []
+        for path in self.fcs_paths:
+            fcs = self._get_data(path)
+            df = fcs.df
+            mask, applied = self._named_population_mask(df, fcs.filename, source)
+            gated_df = df[mask]
+            if mode == "single":
+                if ch_a not in gated_df.columns:
+                    continue
+                value, label = gated_df[ch_a], ch_a
+            else:
+                if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
+                    continue
+                value = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
+                label = f"Ratio {ch_a} / {ch_b}"
+            binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
+            if len(binned) == 0:
+                continue
+            binned = binned.copy()
+            binned.insert(0, "filename", fcs.filename)
+            binned.insert(1, "population", source)
+            binned.insert(2, "channel", label)
+            binned.insert(3, "gates_applied", ";".join(applied) or "none")
+            rows.append(binned)
+
+        if not rows:
+            messagebox.showwarning("Keine Daten", f"Für keine Datei konnte die Population '{source}' angewendet werden.")
+            return
+
+        combined = pd.concat(rows, ignore_index=True)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"all_files_kinetics_{source}.csv",
+            initialdir=self._ensure_exports_dir(),
+        )
+        if not path:
+            return
+        combined.to_csv(path, index=False)
+        messagebox.showinfo(
+            "Exportiert",
+            f"Kinetik (Population: {source}) für {len(rows)} Dateien gespeichert unter:\n{path}\n\n"
+            "Long-Format (eine Zeile pro Datei & Zeit-Bin) — geeignet zum Filtern/Pivotieren für Overlays."
+        )
+
+    def _export_all_kinetics_png(self):
+        source = self._require_named_population(self.kin_gate_source_var)
+        if source is None:
+            return
+        mode = self.kin_mode_var.get()
+        ch_a = self.kin_channel_a_var.get()
+        ch_b = self.kin_channel_b_var.get() if mode == "ratio" else None
+        try:
+            bin_width = float(self.kin_bin_width_var.get())
+            min_signal = float(self.kin_min_signal_var.get())
+        except ValueError:
+            messagebox.showwarning("Ungültige Eingabe", "Bin-Breite / Min. Signal müssen Zahlen sein.")
+            return
+
+        out_dir = filedialog.askdirectory(
+            title="Ordner für PNG-Export wählen", initialdir=self._ensure_exports_dir()
+        )
+        if not out_dir:
+            return
+
+        count = 0
+        for path in self.fcs_paths:
+            fcs = self._get_data(path)
+            df = fcs.df
+            mask, _ = self._named_population_mask(df, fcs.filename, source)
+            gated_df = df[mask]
+            if mode == "single":
+                if ch_a not in gated_df.columns:
+                    continue
+                value = gated_df[ch_a]
+            else:
+                if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
+                    continue
+                value = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
+            binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
+            if len(binned) == 0:
+                continue
+            baseline_end_s = parse_baseline_duration_s(fcs.filename)
+            stem = os.path.splitext(fcs.filename)[0]
+            safe_source = "".join(c if c.isalnum() or c in "-_" else "_" for c in source)
+            out_path = os.path.join(out_dir, f"{stem}_{safe_source}_kinetics.png")
+            plot_kinetics(binned, fcs.filename, baseline_end_s, out_path)
+            count += 1
+
+        messagebox.showinfo("Exportiert", f"{count} Kinetik-PNG(s) (Population: {source}) gespeichert in:\n{out_dir}")
+
+    # ---------------------------------------------------------- clipboard
+    def _copy_to_clipboard(self, figure, status_var: tk.StringVar | None = None):
+        try:
+            copy_figure_to_clipboard(figure)
+        except Exception as exc:
+            messagebox.showerror(
+                "Zwischenablage nicht verfügbar",
+                f"Konnte den Plot nicht in die Zwischenablage kopieren:\n{exc}"
+            )
+            return
+        message = "Plot in die Zwischenablage kopiert — mit Strg+V einfügbar."
+        if status_var is not None:
+            status_var.set(message)
+        else:
+            messagebox.showinfo("Kopiert", message)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--input-dir", default=os.path.join(os.path.dirname(__file__), "..", "Ca2+_kinetic"))
+    parser.add_argument("--gates-dir", default=os.path.join(os.path.dirname(__file__), "..", "gates"))
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    root.title("Ca2+ Kinetik - Gate Editor")
+    root.geometry("1280x800")
+    GatingApp(root, input_dir=args.input_dir, gates_dir=args.gates_dir)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

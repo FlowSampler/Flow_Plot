@@ -1,0 +1,63 @@
+"""Loading helpers for FCS files."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+import flowkit as fk
+import pandas as pd
+
+
+@dataclass
+class FcsData:
+    path: str
+    filename: str
+    df: pd.DataFrame  # raw channel values, one column per PnN channel
+    channel_ranges: dict[str, float] = None  # $PnR instrument range per channel, if available
+
+
+def load_fcs(path: str) -> FcsData:
+    """Load a single FCS file and return its raw (uncompensated, untransformed) event data."""
+    sample = fk.Sample(path)
+    df = sample.as_dataframe(source="raw")
+    # flatten MultiIndex columns (pnn, pns) -> pnn only
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    meta = sample.metadata
+    channel_ranges = {}
+    for i, channel in enumerate(sample.pnn_labels, start=1):
+        raw_range = meta.get(f"p{i}r")
+        if raw_range is not None:
+            try:
+                channel_ranges[channel] = float(raw_range)
+            except (TypeError, ValueError):
+                pass
+
+    return FcsData(path=path, filename=os.path.basename(path), df=df, channel_ranges=channel_ranges)
+
+
+_RESERVED_SUBDIRS = {"gates", "exports"}
+
+
+def find_fcs_files(input_dir: str, recursive: bool = False) -> list[str]:
+    """List .fcs files directly in input_dir, or (recursive=True) anywhere
+    under it — e.g. an experiment folder with one subfolder per condition.
+    The 'gates' and 'exports' subfolders are skipped since those hold
+    gate-set JSON / export output, never raw data."""
+    if recursive:
+        files = []
+        for root, dirnames, filenames in os.walk(input_dir):
+            dirnames[:] = [d for d in dirnames if d not in _RESERVED_SUBDIRS]
+            files.extend(
+                os.path.join(root, f) for f in filenames if f.lower().endswith(".fcs")
+            )
+        files.sort()
+    else:
+        files = [
+            os.path.join(input_dir, f)
+            for f in sorted(os.listdir(input_dir))
+            if f.lower().endswith(".fcs")
+        ]
+    if not files:
+        raise FileNotFoundError(f"No .fcs files found in {input_dir}" + (" (recursively)" if recursive else ""))
+    return files
