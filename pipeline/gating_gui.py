@@ -594,9 +594,12 @@ class GatingApp(ttk.Frame):
         self.kin_bin_width_var = tk.StringVar(value="1.0")
         ttk.Entry(controls, textvariable=self.kin_bin_width_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
 
-        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        kin_min_label = ttk.Label(controls, text="Min. Signal:")
+        kin_min_label.grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
         self.kin_min_signal_var = tk.StringVar(value="1.0")
-        ttk.Entry(controls, textvariable=self.kin_min_signal_var, width=6).grid(row=1, column=7, padx=4, pady=(6, 0))
+        kin_min_entry = ttk.Entry(controls, textvariable=self.kin_min_signal_var, width=6)
+        kin_min_entry.grid(row=1, column=7, padx=4, pady=(6, 0))
+        self.kin_ratio_widgets = [self.kin_channel_b_label, self.kin_channel_b_combo, kin_min_label, kin_min_entry]
 
         ttk.Button(controls, text="Kinetik aktualisieren", command=self._redraw_kinetics).grid(
             row=1, column=8, padx=(12, 4), pady=(6, 0)
@@ -676,6 +679,11 @@ class GatingApp(ttk.Frame):
         )
         kin_disp_combo.pack(side="left", padx=(4, 12))
         kin_disp_combo.bind("<<ComboboxSelected>>", lambda e: self._on_kin_display_changed())
+        # Event-display options live in their own frame so the whole group can
+        # be hidden (pack_forget) when a non-event display is chosen.
+        self.kin_event_frame = ttk.Frame(kin_disp_row)
+        self.kin_event_frame.pack(side="left")
+        kin_disp_row = self.kin_event_frame
         self.kin_overlay_median_var = tk.BooleanVar(value=True)
         self.kin_event_widgets = [
             ttk.Checkbutton(kin_disp_row, text="Median-Linie überlagern", variable=self.kin_overlay_median_var,
@@ -699,13 +707,14 @@ class GatingApp(ttk.Frame):
         ))
         for w in self.kin_event_widgets:
             w.pack(side="left", padx=(0, 6))
-        ttk.Label(
+        self.kin_event_help = ttk.Label(
             controls,
             text="(Einzel-Events: jedes Event als Punkt über der Zeit — bei sehr vielen Events wird für die Anzeige "
             "zufällig auf \"Max. Punkte\" reduziert, der CSV-Export enthält immer alle. \"Dichte\" zeigt alle Events als "
             "Zeit×Wert-Heatmap im Farbschema des Gating-Tabs.)",
             foreground="#555", wraplength=1000,
-        ).grid(row=10, column=0, columnspan=9, sticky="w")
+        )
+        self.kin_event_help.grid(row=10, column=0, columnspan=9, sticky="w")
 
         # --- Ridgeline settings (only active for the Ridgeline display)
         ridge_row = ttk.Frame(controls)
@@ -743,14 +752,20 @@ class GatingApp(ttk.Frame):
         self.kin_ridge_scheme_var = tk.StringVar(value=RIDGE_SCHEME_STIM)
         add(ttk.Combobox(ridge_row2, textvariable=self.kin_ridge_scheme_var, state="readonly",
                          values=ridge_color_schemes(), width=20), padx=(0, 8)).bind("<<ComboboxSelected>>", redraw)
+        # Color buttons sit in their own frame: only the ones the chosen scheme
+        # actually uses are shown (pre/post for "Vor / nach Stimulus", the
+        # single color for "Einheitsfarbe", none for a color gradient).
+        ridge_color_frame = ttk.Frame(ridge_row2)
+        ridge_color_frame.pack(side="left")
         self.kin_ridge_colors = {"pre": "#8c8c8c", "post": "#d62728", "single": "#1f77b4"}
         self.kin_ridge_color_btns = {}
         for key, text in (("pre", "Farbe vor Stimulus…"), ("post", "Farbe nach Stimulus…"), ("single", "Einheitsfarbe…")):
             c = self.kin_ridge_colors[key]
-            btn = tk.Button(ridge_row2, text=text, bg=c, fg="white", activebackground=c, relief="groove",
+            btn = tk.Button(ridge_color_frame, text=text, bg=c, fg="white", activebackground=c, relief="groove",
                             command=lambda k=key: self._kin_pick_ridge_color(k))
-            add(btn, padx=(0, 4))
             self.kin_ridge_color_btns[key] = btn
+        self.kin_ridge_scheme_var.trace_add("write", lambda *a: self._update_kin_ridge_color_buttons())
+        self._update_kin_ridge_color_buttons()
         add(ttk.Label(ridge_row2, text="Kontur:"), padx=(8, 4))
         self.kin_ridge_edge_var = tk.StringVar(value=OVERLAY_EDGE_COLORS[0])
         add(ttk.Combobox(ridge_row2, textvariable=self.kin_ridge_edge_var, state="readonly",
@@ -761,13 +776,15 @@ class GatingApp(ttk.Frame):
         for text, var in (("Gefüllt", self.kin_ridge_fill_var), ("Früh oben", self.kin_ridge_early_top_var),
                           ("Median-Punkte", self.kin_ridge_median_var)):
             add(ttk.Checkbutton(ridge_row2, text=text, variable=var, command=redraw))
-        ttk.Label(
+        ridge_help = ttk.Label(
             controls,
             text="(Ridgeline: ein Kamm pro Zeitfenster, X = Wert. Eine Fenstergrenze liegt genau auf der "
             "Stimulus-Zeit aus dem Dateinamen. \"Werte-Achse Min/Max\" oben begrenzt hier die X-Achse, "
             "\"Zeit-Achse Min/Max\" den Zeitbereich der Kämme.)",
             foreground="#555", wraplength=1000,
-        ).grid(row=13, column=0, columnspan=9, sticky="w")
+        )
+        ridge_help.grid(row=13, column=0, columnspan=9, sticky="w")
+        self.kin_ridge_rows = [ridge_row, ridge_row2, ridge_help]
 
         self.kin_figure = Figure(figsize=(8, 6))
         self.kin_ax = self.kin_figure.add_subplot(111)
@@ -784,19 +801,27 @@ class GatingApp(ttk.Frame):
         self._on_kin_display_changed(redraw=False)
 
     def _on_kin_display_changed(self, redraw: bool = True):
+        # Only show the settings the chosen display actually uses.
         display = self.kin_display_var.get()
-        for widgets, active in ((self.kin_event_widgets, display in KIN_EVENT_DISPLAYS),
-                                (self.kin_ridge_widgets, display == KIN_DISPLAY_RIDGE)):
-            for w in widgets:
-                try:
-                    if isinstance(w, ttk.Combobox):
-                        w.configure(state="readonly" if active else "disabled")
-                    else:
-                        w.configure(state="normal" if active else "disabled")
-                except tk.TclError:
-                    pass
+        is_events = display in KIN_EVENT_DISPLAYS
+        if is_events:
+            self.kin_event_frame.pack(side="left")
+        else:
+            self.kin_event_frame.pack_forget()
+        self._set_shown([self.kin_event_help], is_events)
+        self._set_shown(self.kin_ridge_rows, display == KIN_DISPLAY_RIDGE)
         if redraw:
             self._redraw_kinetics()
+
+    def _update_kin_ridge_color_buttons(self):
+        scheme = self.kin_ridge_scheme_var.get()
+        shown = {"pre": scheme == RIDGE_SCHEME_STIM, "post": scheme == RIDGE_SCHEME_STIM,
+                 "single": scheme == SCHEME_SINGLE}
+        for key, btn in self.kin_ridge_color_btns.items():  # re-pack in fixed order
+            btn.pack_forget()
+        for key, btn in self.kin_ridge_color_btns.items():
+            if shown[key]:
+                btn.pack(side="left", padx=(0, 4))
 
     def _kin_pick_ridge_color(self, key: str):
         from tkinter import colorchooser
@@ -904,9 +929,17 @@ class GatingApp(ttk.Frame):
         }
 
     def _update_kin_mode(self):
-        is_ratio = self.kin_mode_var.get() == "ratio"
-        self.kin_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
-        self.kin_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+        self._set_shown(self.kin_ratio_widgets, self.kin_mode_var.get() == "ratio")
+
+    @staticmethod
+    def _set_shown(widgets, shown: bool):
+        """Show or hide grid-managed widgets. grid_remove() remembers each
+        widget's grid options, so a bare grid() puts it back in place."""
+        for w in widgets:
+            if shown:
+                w.grid()
+            else:
+                w.grid_remove()
 
     @staticmethod
     def _parse_optional_float(s: str) -> float | None:
@@ -953,9 +986,13 @@ class GatingApp(ttk.Frame):
         )
         self.stat_channel_b_combo.grid(row=1, column=3, padx=4, pady=(6, 0))
 
-        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        stat_min_label = ttk.Label(controls, text="Min. Signal:")
+        stat_min_label.grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
         self.stat_min_signal_var = tk.StringVar(value="1.0")
-        ttk.Entry(controls, textvariable=self.stat_min_signal_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
+        stat_min_entry = ttk.Entry(controls, textvariable=self.stat_min_signal_var, width=6)
+        stat_min_entry.grid(row=1, column=5, padx=4, pady=(6, 0))
+        # Kanal B and Min. Signal only matter for a ratio
+        self.stat_ratio_widgets = [self.stat_channel_b_label, self.stat_channel_b_combo, stat_min_label, stat_min_entry]
 
         ttk.Label(controls, text="Schwelle (pos/neg):").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.stat_threshold_var = tk.StringVar(value="")
@@ -1058,9 +1095,12 @@ class GatingApp(ttk.Frame):
         self.ov_channel_b_combo.grid(row=1, column=3, padx=4, pady=(6, 0))
         self.ov_channel_b_combo.bind("<<ComboboxSelected>>", redraw)
 
-        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        ov_min_label = ttk.Label(controls, text="Min. Signal:")
+        ov_min_label.grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_min_signal_var = tk.StringVar(value="1.0")
-        ttk.Entry(controls, textvariable=self.ov_min_signal_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
+        ov_min_entry = ttk.Entry(controls, textvariable=self.ov_min_signal_var, width=6)
+        ov_min_entry.grid(row=1, column=5, padx=4, pady=(6, 0))
+        self.ov_ratio_widgets = [self.ov_channel_b_label, self.ov_channel_b_combo, ov_min_label, ov_min_entry]
 
         ttk.Label(controls, text="Population:").grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_gate_source_var = tk.StringVar(value=GATE_SOURCE_LIVE)
@@ -1076,7 +1116,7 @@ class GatingApp(ttk.Frame):
             controls, textvariable=self.ov_display_var, state="readonly", values=OVERLAY_MODES, width=16
         )
         display_combo.grid(row=2, column=1, padx=4, pady=(6, 0))
-        display_combo.bind("<<ComboboxSelected>>", redraw)
+        display_combo.bind("<<ComboboxSelected>>", lambda e: self._update_overlay_visibility())
 
         ttk.Label(controls, text="Normierung:").grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_norm_var = tk.StringVar(value=OVERLAY_NORMALIZATIONS[0])
@@ -1086,13 +1126,20 @@ class GatingApp(ttk.Frame):
         norm_combo.grid(row=2, column=3, padx=4, pady=(6, 0))
         norm_combo.bind("<<ComboboxSelected>>", redraw)
 
-        ttk.Label(controls, text="Offset Y (%):").grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        # Offset Y: only for "Offset"/"Staggered"; Versatz X: only for "Staggered"
+        ov_offset_label = ttk.Label(controls, text="Offset Y (%):")
+        ov_offset_label.grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_offset_var = tk.StringVar(value="60")
-        ttk.Entry(controls, textvariable=self.ov_offset_var, width=6).grid(row=2, column=5, padx=4, pady=(6, 0))
+        ov_offset_entry = ttk.Entry(controls, textvariable=self.ov_offset_var, width=6)
+        ov_offset_entry.grid(row=2, column=5, padx=4, pady=(6, 0))
+        self.ov_offset_widgets = [ov_offset_label, ov_offset_entry]
 
-        ttk.Label(controls, text="Versatz X (%):").grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        ov_stagger_label = ttk.Label(controls, text="Versatz X (%):")
+        ov_stagger_label.grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_stagger_var = tk.StringVar(value="5")
-        ttk.Entry(controls, textvariable=self.ov_stagger_var, width=6).grid(row=2, column=7, padx=4, pady=(6, 0), sticky="w")
+        ov_stagger_entry = ttk.Entry(controls, textvariable=self.ov_stagger_var, width=6)
+        ov_stagger_entry.grid(row=2, column=7, padx=4, pady=(6, 0), sticky="w")
+        self.ov_stagger_widgets = [ov_stagger_label, ov_stagger_entry]
 
         ttk.Label(controls, text="X-Transform:").grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.ov_transform_var = tk.StringVar(value="Logicle")
@@ -1110,9 +1157,12 @@ class GatingApp(ttk.Frame):
         self.ov_smooth_var = tk.StringVar(value="1.5")
         ttk.Entry(controls, textvariable=self.ov_smooth_var, width=6).grid(row=3, column=5, padx=4, pady=(6, 0))
 
-        ttk.Label(controls, text="Deckkraft Füllung:").grid(row=3, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        ov_alpha_label = ttk.Label(controls, text="Deckkraft Füllung:")
+        ov_alpha_label.grid(row=3, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
         self.ov_alpha_var = tk.StringVar(value="0.35")
-        ttk.Entry(controls, textvariable=self.ov_alpha_var, width=6).grid(row=3, column=7, padx=4, pady=(6, 0), sticky="w")
+        ov_alpha_entry = ttk.Entry(controls, textvariable=self.ov_alpha_var, width=6)
+        ov_alpha_entry.grid(row=3, column=7, padx=4, pady=(6, 0), sticky="w")
+        self.ov_alpha_widgets = [ov_alpha_label, ov_alpha_entry]  # only when "Gefüllt"
 
         check_row = ttk.Frame(controls)
         check_row.grid(row=4, column=0, columnspan=10, sticky="w", pady=(6, 0))
@@ -1125,6 +1175,7 @@ class GatingApp(ttk.Frame):
             ("n / Median in Legende", self.ov_stats_var),
         ):
             ttk.Checkbutton(check_row, text=text, variable=var, command=redraw).pack(side="left", padx=(0, 12))
+        self.ov_fill_var.trace_add("write", lambda *a: self._update_overlay_visibility(redraw=False))
 
         ttk.Label(check_row, text="X-Achse Min:").pack(side="left", padx=(12, 0))
         self.ov_x_min_var = tk.StringVar(value="")
@@ -1157,6 +1208,7 @@ class GatingApp(ttk.Frame):
             bg=self.ov_single_color, fg="white", activebackground=self.ov_single_color, relief="groove",
         )
         self.ov_single_color_btn.pack(side="left", padx=(0, 16))
+        self.ov_scheme_var.trace_add("write", lambda *a: self._update_overlay_visibility(redraw=False))
 
         ttk.Label(
             controls,
@@ -1232,9 +1284,19 @@ class GatingApp(ttk.Frame):
         self._refresh_overlay_file_list(select_paths=set())
 
     def _update_overlay_mode(self, redraw: bool = True):
-        is_ratio = self.ov_mode_var.get() == "ratio"
-        self.ov_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
-        self.ov_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+        self._set_shown(self.ov_ratio_widgets, self.ov_mode_var.get() == "ratio")
+        self._update_overlay_visibility(redraw=redraw)
+
+    def _update_overlay_visibility(self, redraw: bool = True):
+        """Only show the overlay settings the current choices actually use."""
+        display = self.ov_display_var.get()
+        self._set_shown(self.ov_offset_widgets, display in ("Offset", "Staggered"))
+        self._set_shown(self.ov_stagger_widgets, display == "Staggered")
+        self._set_shown(self.ov_alpha_widgets, self.ov_fill_var.get())
+        if self.ov_scheme_var.get() == SCHEME_SINGLE:
+            self.ov_single_color_btn.pack(side="left", padx=(0, 16))
+        else:
+            self.ov_single_color_btn.pack_forget()
         if redraw:
             self._schedule_overlay_redraw()
 
@@ -1503,9 +1565,7 @@ class GatingApp(ttk.Frame):
         self.ov_status_var.set(f"Histogramm-Daten gespeichert: {path}")
 
     def _update_stat_mode(self):
-        is_ratio = self.stat_mode_var.get() == "ratio"
-        self.stat_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
-        self.stat_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+        self._set_shown(self.stat_ratio_widgets, self.stat_mode_var.get() == "ratio")
 
     def _stat_values(self, df: pd.DataFrame) -> tuple[pd.Series, str]:
         mode = self.stat_mode_var.get()
