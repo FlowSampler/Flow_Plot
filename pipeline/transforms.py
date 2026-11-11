@@ -50,6 +50,38 @@ class _InvertedLogicleMplTransform(mtransforms.Transform):
         return _LogicleMplTransform(self.logicle)
 
 
+class _LogicleDecadeLocator(mticker.Locator):
+    """Ticks at 0 and ±10^k (major) or ±m·10^k, m=2..9 (minor). The default
+    AutoLocator puts evenly spaced LINEAR ticks on a log-like axis, which all
+    pile up at the top end ('50000100000150000...')."""
+
+    def __init__(self, minor: bool = False):
+        self.minor = minor
+
+    def __call__(self):
+        vmin, vmax = self.axis.get_view_interval()
+        return self.tick_values(vmin, vmax)
+
+    def tick_values(self, vmin, vmax):
+        lo, hi = min(vmin, vmax), max(vmin, vmax)
+        k_max = int(np.ceil(np.log10(max(abs(lo), abs(hi), 10.0))))
+        # Decades below 10^2 sit inside logicle's near-linear zone around 0
+        # and would overlap the '0' label, so start there.
+        mults = range(2, 10) if self.minor else (1,)
+        ticks = [] if self.minor else [0.0]
+        for k in range(2, k_max + 1):
+            for m in mults:
+                ticks += [m * 10.0**k, -m * 10.0**k]
+        return np.array(sorted(t for t in ticks if lo <= t <= hi))
+
+
+def _decade_label(v, _pos=None) -> str:
+    if v == 0:
+        return "0"
+    k = int(round(np.log10(abs(v))))
+    return f"${'-' if v < 0 else ''}10^{{{k}}}$"
+
+
 class LogicleScale(mscale.ScaleBase):
     """Registers as matplotlib scale name 'logicle'. Use via
     ax.set_xscale('logicle', t=262144, w=0.5, m=4.5, a=0.0)."""
@@ -64,8 +96,10 @@ class LogicleScale(mscale.ScaleBase):
         return _LogicleMplTransform(self._logicle)
 
     def set_default_locators_and_formatters(self, axis):
-        axis.set_major_locator(mticker.AutoLocator())
-        axis.set_major_formatter(mticker.ScalarFormatter())
+        axis.set_major_locator(_LogicleDecadeLocator())
+        axis.set_major_formatter(mticker.FuncFormatter(_decade_label))
+        axis.set_minor_locator(_LogicleDecadeLocator(minor=True))
+        axis.set_minor_formatter(mticker.NullFormatter())
 
     def limit_range_for_scale(self, vmin, vmax, minpos):
         return vmin, vmax

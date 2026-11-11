@@ -22,9 +22,12 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import matplotlib
 import numpy as np
 import pandas as pd
+from matplotlib import patheffects
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.colors import ListedColormap, LogNorm
 from matplotlib.figure import Figure
 from matplotlib.patches import Ellipse as EllipsePatch
 from matplotlib.patches import Polygon as PolygonPatch
@@ -52,6 +55,16 @@ from gating import (
     save_gate_tree,
 )
 from clipboard_utils import copy_figure_to_clipboard
+from histogram_overlay import (
+    MODES as OVERLAY_MODES,
+    NORMALIZATIONS as OVERLAY_NORMALIZATIONS,
+    NORM_COUNT,
+    DisplayTransform,
+    OverlaySeries,
+    compute_overlay,
+    default_color,
+    draw_overlay,
+)
 from io_utils import FcsData, find_fcs_files, load_fcs
 from kinetics import bin_kinetics, compute_ratio, parse_baseline_duration_s, value_stats
 from run_pipeline import plot_kinetics
@@ -60,7 +73,16 @@ from transforms import TRANSFORM_NAMES, apply_axis_scale
 SHAPES = ["Polygon", "Rectangle", "Ellipse", "Quadrant", "Quadrant (Winkel)"]
 QUADRANT_SHAPES = ("Quadrant", "Quadrant (Winkel)")
 SCOPES = ["all", "group", "file"]
-PLOT_TYPES = ["Scatter", "Histogram", "Density", "Contour"]
+HIST_1D = "Histogramm (1D)"
+PLOT_TYPES = ["Pseudocolor", "Contour", "Density", "Scatter", HIST_1D]
+# Display name -> matplotlib colormap for the 2D density plots.
+COLORMAPS = {
+    "Turbo (FlowJo-ähnlich)": "turbo",
+    "Viridis": "viridis",
+    "Magma": "magma_r",
+    "Blau (einfarbig)": "Blues",
+    "Graustufen": "Greys",
+}
 DEFAULT_CHANNEL_PAIR = ("FSC-A", "SSC-A")
 DEFAULT_RATIO_PAIR = ("PerCP-A", "Qdot 655-A")
 
@@ -102,6 +124,9 @@ class GatingApp(ttk.Frame):
         self._kin_last_label = None
         self._kin_last_filename = None
         self._kin_last_population = None
+        self.ov_colors: dict[str, str] = {}  # per-file color overrides for the overlay tab (path -> hex)
+        self._ov_redraw_job = None
+        self._ov_last_result = None
 
         self._build_ui()
         if self.fcs_paths:
@@ -161,12 +186,16 @@ class GatingApp(ttk.Frame):
             left, textvariable=self.experiment_dir_var, foreground="#555", wraplength=250, justify="left"
         ).pack(anchor="w", padx=4)
         ttk.Button(left, text="Experiment-Ordner wählen...", command=self._choose_experiment_folder).pack(
-            fill="x", padx=4, pady=(2, 8)
+            fill="x", padx=4, pady=(2, 2)
+        )
+        ttk.Button(left, text="Dateien neu einlesen (Ordner erneut scannen)", command=self._rescan_files).pack(
+            fill="x", padx=4, pady=(0, 2)
         )
         ttk.Label(
             left,
-            text="(lädt automatisch alle .fcs-Dateien aus diesem Ordner + Unterordnern; "
-            "Gates und Exporte werden dort in 'gates/' bzw. 'exports/' gespeichert)",
+            text="(lädt automatisch alle .fcs-Dateien aus diesem Ordner + Unterordnern; neu hinzugefügte Dateien "
+            "erscheinen erst nach 'Dateien neu einlesen', nicht von selbst; Gates und Exporte werden hier in "
+            "'gates/' bzw. 'exports/' gespeichert)",
             foreground="#555", wraplength=250
         ).pack(anchor="w", padx=4, pady=(0, 8))
 
@@ -207,13 +236,16 @@ class GatingApp(ttk.Frame):
         gating_tab = ttk.Frame(self.notebook)
         kinetics_tab = ttk.Frame(self.notebook)
         stats_tab = ttk.Frame(self.notebook)
+        overlay_tab = ttk.Frame(self.notebook)
         self.notebook.add(gating_tab, text="Gating")
         self.notebook.add(kinetics_tab, text="Kinetik")
         self.notebook.add(stats_tab, text="Statistik")
+        self.notebook.add(overlay_tab, text="Histogramm-Overlay")
 
         self._build_gating_tab(gating_tab)
         self._build_kinetics_tab(kinetics_tab)
         self._build_stats_tab(stats_tab)
+        self._build_overlay_tab(overlay_tab)
         self._refresh_gate_source_combos()
 
     def _on_tab_changed(self, _event):
@@ -222,6 +254,8 @@ class GatingApp(ttk.Frame):
             self._redraw_kinetics()
         elif idx == 2:
             self._redraw_stats()
+        elif idx == 3:
+            self._redraw_overlay()
 
     def _build_gating_tab(self, parent):
         gating_pane = ttk.PanedWindow(parent, orient="horizontal")
@@ -262,14 +296,22 @@ class GatingApp(ttk.Frame):
         ttk.Label(controls, text="Darstellung:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.plot_type_var = tk.StringVar(value=PLOT_TYPES[0])
         plot_type_combo = ttk.Combobox(
-            controls, textvariable=self.plot_type_var, state="readonly", values=PLOT_TYPES, width=10
+            controls, textvariable=self.plot_type_var, state="readonly", values=PLOT_TYPES, width=14
         )
         plot_type_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
-        plot_type_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
+        plot_type_combo.bind("<<ComboboxSelected>>", lambda e: self._on_plot_type_changed())
+
+        ttk.Label(controls, text="Farbskala:").grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.colormap_var = tk.StringVar(value=next(iter(COLORMAPS)))
+        colormap_combo = ttk.Combobox(
+            controls, textvariable=self.colormap_var, state="readonly", values=list(COLORMAPS), width=20
+        )
+        colormap_combo.grid(row=1, column=3, columnspan=2, padx=4, pady=(6, 0), sticky="w")
+        colormap_combo.bind("<<ComboboxSelected>>", lambda e: self._redraw())
         ttk.Label(
-            controls, text="(Histogram/Density/Contour zeigen die Verteilung zur Gate-Abschätzung)",
+            controls, text="(Farbe = log. Event-Dichte, weiß = leer; Histogramm (1D) = X-Intensität gegen Events)",
             foreground="#555"
-        ).grid(row=1, column=2, columnspan=5, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=5, columnspan=2, sticky="w", pady=(6, 0))
 
         ttk.Label(controls, text="Quadranten-Winkel (°):").grid(row=1, column=7, sticky="w", padx=(12, 0), pady=(6, 0))
         self.quadrant_angle_var = tk.StringVar(value="0")
@@ -472,6 +514,22 @@ class GatingApp(ttk.Frame):
         self._update_scope_hint()
         self._on_shape_changed()
         self._refresh_strategy_combo()
+
+    def _on_plot_type_changed(self):
+        if self.plot_type_var.get() == HIST_1D:
+            self.status_var.set(
+                "Histogramm (1D): X-Kanal gegen Anzahl Events. Grau = aktuelle Population, farbige Linien = "
+                "Kind-Gates (gleiche Farbe wie ihr Umriss im 2D-Plot). Zum Zeichnen eines Gates wird "
+                "automatisch auf Pseudocolor umgeschaltet."
+            )
+        self._redraw()
+
+    def _ensure_2d_plot_for_gating(self):
+        """Gates live on an X/Y channel pair — they can't be drawn on the 1D
+        histogram (its Y axis is event count, not a channel)."""
+        if self.plot_type_var.get() == HIST_1D:
+            self.plot_type_var.set("Pseudocolor")
+            self._redraw()
 
     def _on_shape_changed(self, _event=None):
         """Enable the angle entry only for the tilted quadrant shape — the
@@ -727,6 +785,425 @@ class GatingApp(ttk.Frame):
         self.cohort_df: pd.DataFrame | None = None
         self._update_stat_mode()
 
+    # ---------------------------------------------------------- histogram overlay tab
+    def _build_overlay_tab(self, parent):
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", padx=4, pady=4)
+        redraw = lambda *a: self._schedule_overlay_redraw()  # noqa: E731
+
+        ttk.Label(controls, text="Quelle:").grid(row=0, column=0, sticky="w")
+        self.ov_mode_var = tk.StringVar(value="single")
+        mode_frame = ttk.Frame(controls)
+        mode_frame.grid(row=0, column=1, columnspan=3, sticky="w")
+        for text, value in (("Einzelkanal", "single"), ("Ratio (Kanal A / Kanal B)", "ratio")):
+            ttk.Radiobutton(
+                mode_frame, text=text, variable=self.ov_mode_var, value=value, command=self._update_overlay_mode
+            ).pack(side="left", padx=(0, 8))
+
+        ttk.Label(controls, text="Kanal A:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.ov_channel_a_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[0])
+        self.ov_channel_a_combo = ttk.Combobox(controls, textvariable=self.ov_channel_a_var, state="readonly", width=16)
+        self.ov_channel_a_combo.grid(row=1, column=1, padx=4, pady=(6, 0))
+        self.ov_channel_a_combo.bind("<<ComboboxSelected>>", redraw)
+
+        self.ov_channel_b_label = ttk.Label(controls, text="Kanal B (Nenner):")
+        self.ov_channel_b_label.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_channel_b_var = tk.StringVar(value=DEFAULT_RATIO_PAIR[1])
+        self.ov_channel_b_combo = ttk.Combobox(controls, textvariable=self.ov_channel_b_var, state="readonly", width=16)
+        self.ov_channel_b_combo.grid(row=1, column=3, padx=4, pady=(6, 0))
+        self.ov_channel_b_combo.bind("<<ComboboxSelected>>", redraw)
+
+        ttk.Label(controls, text="Min. Signal:").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_min_signal_var = tk.StringVar(value="1.0")
+        ttk.Entry(controls, textvariable=self.ov_min_signal_var, width=6).grid(row=1, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Population:").grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_gate_source_var = tk.StringVar(value=GATE_SOURCE_LIVE)
+        self.ov_gate_source_combo = ttk.Combobox(
+            controls, textvariable=self.ov_gate_source_var, state="readonly", width=30
+        )
+        self.ov_gate_source_combo.grid(row=1, column=7, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+        self.ov_gate_source_combo.bind("<<ComboboxSelected>>", redraw)
+
+        ttk.Label(controls, text="Darstellung:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.ov_display_var = tk.StringVar(value=OVERLAY_MODES[0])
+        display_combo = ttk.Combobox(
+            controls, textvariable=self.ov_display_var, state="readonly", values=OVERLAY_MODES, width=16
+        )
+        display_combo.grid(row=2, column=1, padx=4, pady=(6, 0))
+        display_combo.bind("<<ComboboxSelected>>", redraw)
+
+        ttk.Label(controls, text="Normierung:").grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_norm_var = tk.StringVar(value=OVERLAY_NORMALIZATIONS[0])
+        norm_combo = ttk.Combobox(
+            controls, textvariable=self.ov_norm_var, state="readonly", values=OVERLAY_NORMALIZATIONS, width=20
+        )
+        norm_combo.grid(row=2, column=3, padx=4, pady=(6, 0))
+        norm_combo.bind("<<ComboboxSelected>>", redraw)
+
+        ttk.Label(controls, text="Offset Y (%):").grid(row=2, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_offset_var = tk.StringVar(value="60")
+        ttk.Entry(controls, textvariable=self.ov_offset_var, width=6).grid(row=2, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Versatz X (%):").grid(row=2, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_stagger_var = tk.StringVar(value="5")
+        ttk.Entry(controls, textvariable=self.ov_stagger_var, width=6).grid(row=2, column=7, padx=4, pady=(6, 0), sticky="w")
+
+        ttk.Label(controls, text="X-Transform:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.ov_transform_var = tk.StringVar(value="Logicle")
+        tr_combo = ttk.Combobox(
+            controls, textvariable=self.ov_transform_var, state="readonly", values=TRANSFORM_NAMES, width=10
+        )
+        tr_combo.grid(row=3, column=1, padx=4, pady=(6, 0))
+        tr_combo.bind("<<ComboboxSelected>>", redraw)
+
+        ttk.Label(controls, text="Bins:").grid(row=3, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_bins_var = tk.StringVar(value="256")
+        ttk.Entry(controls, textvariable=self.ov_bins_var, width=6).grid(row=3, column=3, padx=4, pady=(6, 0), sticky="w")
+
+        ttk.Label(controls, text="Glättung (Bins):").grid(row=3, column=4, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_smooth_var = tk.StringVar(value="1.5")
+        ttk.Entry(controls, textvariable=self.ov_smooth_var, width=6).grid(row=3, column=5, padx=4, pady=(6, 0))
+
+        ttk.Label(controls, text="Deckkraft Füllung:").grid(row=3, column=6, sticky="w", padx=(12, 0), pady=(6, 0))
+        self.ov_alpha_var = tk.StringVar(value="0.35")
+        ttk.Entry(controls, textvariable=self.ov_alpha_var, width=6).grid(row=3, column=7, padx=4, pady=(6, 0), sticky="w")
+
+        check_row = ttk.Frame(controls)
+        check_row.grid(row=4, column=0, columnspan=10, sticky="w", pady=(6, 0))
+        self.ov_fill_var = tk.BooleanVar(value=True)
+        self.ov_reverse_var = tk.BooleanVar(value=False)
+        self.ov_stats_var = tk.BooleanVar(value=True)
+        for text, var in (
+            ("Gefüllt", self.ov_fill_var),
+            ("Reihenfolge umkehren", self.ov_reverse_var),
+            ("n / Median in Legende", self.ov_stats_var),
+        ):
+            ttk.Checkbutton(check_row, text=text, variable=var, command=redraw).pack(side="left", padx=(0, 12))
+
+        ttk.Label(check_row, text="X-Achse Min:").pack(side="left", padx=(12, 0))
+        self.ov_x_min_var = tk.StringVar(value="")
+        ttk.Entry(check_row, textvariable=self.ov_x_min_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Label(check_row, text="Max:").pack(side="left")
+        self.ov_x_max_var = tk.StringVar(value="")
+        ttk.Entry(check_row, textvariable=self.ov_x_max_var, width=8).pack(side="left", padx=(4, 8))
+        ttk.Button(check_row, text="Ausreißer abschneiden (0.5–99.5 %)", command=self._overlay_autofit_x).pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Button(check_row, text="Auto", command=self._overlay_reset_x).pack(side="left")
+
+        for v in (
+            self.ov_min_signal_var, self.ov_offset_var, self.ov_stagger_var, self.ov_bins_var,
+            self.ov_smooth_var, self.ov_alpha_var, self.ov_x_min_var, self.ov_x_max_var,
+        ):
+            v.trace_add("write", redraw)
+
+        ttk.Label(
+            controls,
+            text="Overlay = übereinander · Offset = vertikal versetzt (Ridgeline) · Staggered = vertikal + "
+            "horizontal versetzt · Getrennt = eigenes Panel je Datei. Die erste Datei liegt vorne/unten. "
+            "\"Live\" wendet den aktuell angezeigten Knoten des Gate-Baums auf JEDE Datei an.",
+            foreground="#555", wraplength=1000,
+        ).grid(row=5, column=0, columnspan=10, sticky="w", pady=(4, 0))
+
+        body = ttk.PanedWindow(parent, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+
+        files_frame = ttk.Frame(body, width=260)
+        body.add(files_frame, weight=0)
+        ttk.Label(files_frame, text="Dateien im Overlay", font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(
+            files_frame, text="Strg/Shift-Klick = Mehrfachauswahl\nDoppelklick = Farbe ändern",
+            foreground="#555", justify="left"
+        ).pack(anchor="w")
+        list_container = ttk.Frame(files_frame)
+        list_container.pack(fill="both", expand=True, pady=4)
+        self.ov_file_listbox = tk.Listbox(list_container, selectmode="extended", exportselection=False, width=36)
+        ov_vsb = ttk.Scrollbar(list_container, orient="vertical", command=self.ov_file_listbox.yview)
+        self.ov_file_listbox.configure(yscrollcommand=ov_vsb.set)
+        self.ov_file_listbox.pack(side="left", fill="both", expand=True)
+        ov_vsb.pack(side="right", fill="y")
+        self.ov_file_listbox.bind("<<ListboxSelect>>", redraw)
+        self.ov_file_listbox.bind("<Double-Button-1>", self._overlay_pick_color)
+
+        sel_btns = ttk.Frame(files_frame)
+        sel_btns.pack(fill="x")
+        ttk.Button(sel_btns, text="Alle", command=lambda: self._overlay_select(lambda p: True)).pack(
+            side="left", expand=True, fill="x"
+        )
+        ttk.Button(sel_btns, text="Keine", command=lambda: self._overlay_select(lambda p: False)).pack(
+            side="left", expand=True, fill="x"
+        )
+        ttk.Button(
+            sel_btns, text="Aktuelle", command=lambda: self._overlay_select(lambda p: p == self.current_path)
+        ).pack(side="left", expand=True, fill="x")
+
+        filter_row = ttk.Frame(files_frame)
+        filter_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(filter_row, text="Name enthält:").pack(side="left")
+        self.ov_filter_var = tk.StringVar(value="")
+        ttk.Entry(filter_row, textvariable=self.ov_filter_var, width=12).pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(filter_row, text="Auswählen", command=self._overlay_select_by_filter).pack(side="left")
+        ttk.Button(files_frame, text="Farben zurücksetzen", command=self._overlay_reset_colors).pack(fill="x", pady=(4, 0))
+
+        plot_frame = ttk.Frame(body)
+        body.add(plot_frame, weight=1)
+        self.ov_figure = Figure(figsize=(8, 6))
+        self.ov_canvas = FigureCanvasTkAgg(self.ov_figure, master=plot_frame)
+        self.ov_canvas.get_tk_widget().pack(fill="both", expand=True)
+        ov_toolbar_row = ttk.Frame(plot_frame)
+        ov_toolbar_row.pack(fill="x")
+        ov_toolbar = NavigationToolbar2Tk(self.ov_canvas, ov_toolbar_row, pack_toolbar=False)
+        ov_toolbar.update()
+        ov_toolbar.pack(side="left")
+        ttk.Button(
+            ov_toolbar_row, text="Plot in Zwischenablage kopieren",
+            command=lambda: self._copy_to_clipboard(self.ov_figure, self.ov_status_var)
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(ov_toolbar_row, text="Histogramm-Daten als CSV", command=self._export_overlay_csv).pack(
+            side="left", padx=(4, 0)
+        )
+
+        self.ov_status_var = tk.StringVar(value="Dateien links auswählen.")
+        ttk.Label(plot_frame, textvariable=self.ov_status_var, anchor="w").pack(fill="x", padx=4, pady=(0, 4))
+
+        self._update_overlay_mode(redraw=False)
+        self._refresh_overlay_file_list(select_paths=set())
+
+    def _update_overlay_mode(self, redraw: bool = True):
+        is_ratio = self.ov_mode_var.get() == "ratio"
+        self.ov_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
+        self.ov_channel_b_combo.configure(state="readonly" if is_ratio else "disabled")
+        if redraw:
+            self._schedule_overlay_redraw()
+
+    def _overlay_color(self, path: str) -> str:
+        if path in self.ov_colors:
+            return self.ov_colors[path]
+        return default_color(self.fcs_paths.index(path) if path in self.fcs_paths else 0)
+
+    def _overlay_selected_paths(self) -> list[str]:
+        return [self.fcs_paths[i] for i in self.ov_file_listbox.curselection() if i < len(self.fcs_paths)]
+
+    def _refresh_overlay_file_list(self, select_paths: set[str] | None = None):
+        """Rebuild the overlay file list (keeps the current selection unless
+        select_paths is given). Each row is tinted in that file's curve color."""
+        if select_paths is None:
+            select_paths = set(self._overlay_selected_paths())
+        lb = self.ov_file_listbox
+        lb.delete(0, "end")
+        for i, p in enumerate(self.fcs_paths):
+            lb.insert("end", os.path.relpath(p, self.input_dir))
+            color = self._overlay_color(p)
+            lb.itemconfig(i, foreground=color, selectbackground=color, selectforeground="white")
+            if p in select_paths:
+                lb.selection_set(i)
+
+    def _overlay_select(self, predicate):
+        self._refresh_overlay_file_list(select_paths={p for p in self.fcs_paths if predicate(p)})
+        self._schedule_overlay_redraw()
+
+    def _overlay_select_by_filter(self):
+        needle = self.ov_filter_var.get().strip().lower()
+        if not needle:
+            return
+        self._overlay_select(lambda p: needle in os.path.basename(p).lower())
+
+    def _overlay_pick_color(self, event):
+        idx = self.ov_file_listbox.nearest(event.y)
+        if idx < 0 or idx >= len(self.fcs_paths):
+            return
+        from tkinter import colorchooser
+
+        path = self.fcs_paths[idx]
+        _, hex_color = colorchooser.askcolor(
+            color=self._overlay_color(path), title=f"Farbe für {os.path.basename(path)}", parent=self
+        )
+        if not hex_color:
+            return
+        self.ov_colors[path] = hex_color
+        selected = set(self._overlay_selected_paths()) | {path}
+        self._refresh_overlay_file_list(select_paths=selected)
+        self._schedule_overlay_redraw()
+
+    def _overlay_reset_colors(self):
+        self.ov_colors.clear()
+        self._refresh_overlay_file_list()
+        self._schedule_overlay_redraw()
+
+    def _schedule_overlay_redraw(self, *_):
+        """Debounced: typing into an entry field fires once per keystroke,
+        and every redraw re-histograms all selected files."""
+        if self._ov_redraw_job is not None:
+            self.after_cancel(self._ov_redraw_job)
+        self._ov_redraw_job = self.after(250, self._redraw_overlay)
+
+    def _overlay_population_mask(self, df, filename: str, source: str) -> tuple[np.ndarray, str]:
+        if source == GATE_SOURCE_LIVE:
+            base = self._base_mask_for(df, filename)
+            return node_mask(df, self.gate_tree, self.current_node_id, base_mask=base), \
+                self.gate_tree[self.current_node_id].name
+        if source == GATE_SOURCE_NONE:
+            return np.ones(len(df), dtype=bool), "ungegated"
+        mask, applied = apply_named_gate_set(df, filename, self.existing_gate_sets, source)
+        return mask, (applied[0] if applied else f"{source} (kein Treffer)")
+
+    def _overlay_collect_series(self) -> tuple[list[OverlaySeries], str, list[str]]:
+        """Per selected file: gated population -> finite values of the chosen
+        channel/ratio. Returns (series, x_label, skipped filenames)."""
+        source = self.ov_gate_source_var.get()
+        mode = self.ov_mode_var.get()
+        ch_a, ch_b = self.ov_channel_a_var.get(), self.ov_channel_b_var.get()
+        min_signal = self._parse_optional_float(self.ov_min_signal_var.get())
+        min_signal = 1.0 if min_signal is None else min_signal
+        x_label = ch_a if mode == "single" else f"Ratio {ch_a} / {ch_b}"
+
+        paths = self._overlay_selected_paths()
+        if self.ov_reverse_var.get():
+            paths = paths[::-1]
+        series, skipped = [], []
+        for path in paths:
+            fcs = self._get_data(path)
+            df = fcs.df
+            needed = [ch_a] if mode == "single" else [ch_a, ch_b]
+            if any(c not in df.columns for c in needed):
+                skipped.append(fcs.filename)
+                continue
+            mask, _ = self._overlay_population_mask(df, fcs.filename, source)
+            gated = df[mask]
+            if mode == "single":
+                values = gated[ch_a].to_numpy(dtype=float)
+            else:
+                values = compute_ratio(gated, ch_a, ch_b, min_signal=min_signal).to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if not len(values):
+                skipped.append(fcs.filename)
+                continue
+            series.append(OverlaySeries(
+                label=os.path.splitext(fcs.filename)[0], values=values,
+                color=self._overlay_color(path), n_gated=int(mask.sum()),
+            ))
+        return series, x_label, skipped
+
+    def _overlay_display_transform(self, series: list[OverlaySeries]) -> DisplayTransform:
+        try:
+            linthresh = float(self.log_linthresh_var.get())
+        except ValueError:
+            linthresh = 10.0
+        try:
+            logicle_w = float(self.logicle_w_var.get())
+        except ValueError:
+            logicle_w = 0.5
+        try:
+            logicle_m = float(self.logicle_m_var.get())
+        except ValueError:
+            logicle_m = 4.5
+        # Logicle top-of-scale: the channel's declared range when plotting a
+        # raw channel; for a ratio (no instrument range) the data maximum.
+        channel_range = None
+        if self.ov_mode_var.get() == "single" and self.current_path:
+            channel_range = (self._get_data(self.current_path).channel_ranges or {}).get(self.ov_channel_a_var.get())
+        if not channel_range:
+            channel_range = max((float(np.max(np.abs(s.values))) for s in series), default=262144.0)
+        return DisplayTransform(
+            self.ov_transform_var.get(), channel_range=channel_range,
+            log_linthresh=linthresh, logicle_w=logicle_w, logicle_m=logicle_m,
+        )
+
+    def _redraw_overlay(self):
+        self._ov_redraw_job = None
+        if not hasattr(self, "ov_figure") or self.notebook.index(self.notebook.select()) != 3:
+            return
+        series, x_label, skipped = self._overlay_collect_series()
+
+        def num(var, default, lo=None, hi=None):
+            v = self._parse_optional_float(var.get())
+            v = default if v is None else v
+            if lo is not None:
+                v = max(lo, v)
+            if hi is not None:
+                v = min(hi, v)
+            return v
+
+        x_lo = self._parse_optional_float(self.ov_x_min_var.get())
+        x_hi = self._parse_optional_float(self.ov_x_max_var.get())
+        if x_lo is not None and x_hi is not None and x_lo >= x_hi:
+            x_lo = x_hi = None
+
+        try:
+            tr = self._overlay_display_transform(series)
+            result = compute_overlay(
+                series, tr, n_bins=int(num(self.ov_bins_var, 256, 4, 4096)), lo=x_lo, hi=x_hi,
+                normalization=self.ov_norm_var.get(), smooth_sigma=num(self.ov_smooth_var, 0.0, 0.0),
+            )
+            pop = self.ov_gate_source_var.get()
+            if pop == GATE_SOURCE_LIVE:
+                pop = f"Live: {self.gate_tree[self.current_node_id].name}"
+            x_limits = None
+            if len(result.centers_raw):
+                x_limits = (
+                    x_lo if x_lo is not None else float(result.centers_raw[0]),
+                    x_hi if x_hi is not None else float(result.centers_raw[-1]),
+                )
+            draw_overlay(
+                self.ov_figure, result, tr, self.ov_display_var.get(), x_label,
+                title=f"Population: {pop}",
+                offset_frac=num(self.ov_offset_var, 60, 0) / 100.0,
+                stagger_frac=num(self.ov_stagger_var, 5, 0) / 100.0,
+                fill=self.ov_fill_var.get(), alpha=num(self.ov_alpha_var, 0.35, 0.0, 1.0),
+                legend_stats=self.ov_stats_var.get(), x_limits=x_limits,
+            )
+            try:
+                self.ov_figure.tight_layout()
+            except Exception:
+                pass
+        except Exception as exc:
+            self.ov_status_var.set(f"Fehler beim Zeichnen: {exc}")
+            return
+        self.ov_canvas.draw_idle()
+        self._ov_last_result = (result, x_label) if series else None
+
+        msg = f"{len(series)} Datei(en) im Overlay."
+        n_out = sum(result.n_out_of_range)
+        if n_out:
+            msg += f"  {n_out} Events außerhalb der X-Grenzen nicht gezählt."
+        if skipped:
+            msg += f"  Übersprungen (Kanal fehlt / keine Events): {', '.join(skipped)}"
+        self.ov_status_var.set(msg)
+
+    def _overlay_autofit_x(self):
+        series, _, _ = self._overlay_collect_series()
+        if not series:
+            return
+        pooled = np.concatenate([s.values for s in series])
+        lo, hi = np.percentile(pooled, [0.5, 99.5])
+        self.ov_x_min_var.set(f"{lo:.4g}")
+        self.ov_x_max_var.set(f"{hi:.4g}")
+
+    def _overlay_reset_x(self):
+        self.ov_x_min_var.set("")
+        self.ov_x_max_var.set("")
+
+    def _export_overlay_csv(self):
+        if self._ov_last_result is None:
+            messagebox.showwarning("Keine Daten", "Bitte zuerst Dateien für das Overlay auswählen.")
+            return
+        result, x_label = self._ov_last_result
+        rows = []
+        for s, y, n_out in zip(result.series, result.curves, result.n_out_of_range):
+            rows.append(pd.DataFrame({
+                "filename": s.label, "channel": x_label, "bin_center": result.centers_raw,
+                result.y_label: y, "n_events": len(s.values), "n_out_of_range": n_out,
+            }))
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="histogram_overlay.csv",
+            initialdir=self._ensure_exports_dir(),
+        )
+        if not path:
+            return
+        pd.concat(rows, ignore_index=True).to_csv(path, index=False)
+        self.ov_status_var.set(f"Histogramm-Daten gespeichert: {path}")
+
     def _update_stat_mode(self):
         is_ratio = self.stat_mode_var.get() == "ratio"
         self.stat_channel_b_label.configure(text="Kanal B (Nenner):" if is_ratio else "")
@@ -882,6 +1359,46 @@ class GatingApp(ttk.Frame):
             return
         self._load_experiment(chosen)
 
+    def _rescan_files(self):
+        """Re-scan the current experiment folder for .fcs files — unlike
+        _load_experiment, this does NOT touch the gate tree/strategy or
+        cached data for files still present, so it's safe to use mid-session
+        after copying new files in (nothing here watches the folder live, so
+        new files never appear on their own)."""
+        if not self.input_dir or not os.path.isdir(self.input_dir):
+            messagebox.showwarning("Kein Ordner geladen", "Bitte zuerst einen Experiment-Ordner wählen.")
+            return
+        try:
+            fcs_paths = find_fcs_files(self.input_dir, recursive=True)
+        except FileNotFoundError as exc:
+            messagebox.showwarning("Keine Dateien gefunden", str(exc))
+            return
+
+        added = sorted(set(fcs_paths) - set(self.fcs_paths))
+        removed = sorted(set(self.fcs_paths) - set(fcs_paths))
+        for p in removed:
+            self.data_cache.pop(p, None)
+
+        previous_selection = self.current_path
+        self.fcs_paths = fcs_paths
+        self.file_listbox.delete(0, "end")
+        for p in self.fcs_paths:
+            self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
+
+        if previous_selection in self.fcs_paths:
+            idx = self.fcs_paths.index(previous_selection)
+            self.file_listbox.selection_clear(0, "end")
+            self.file_listbox.selection_set(idx)
+            self.file_listbox.see(idx)
+            self.current_path = previous_selection
+        elif self.fcs_paths:
+            self._select_file_index(0)
+        self._refresh_overlay_file_list()
+
+        self.status_var.set(
+            f"Dateiliste aktualisiert: {len(added)} neu, {len(removed)} entfernt, {len(self.fcs_paths)} gesamt."
+        )
+
     def _load_experiment(self, root_dir: str):
         """Point the whole app at a new experiment folder: .fcs files are
         picked up recursively from it, gate-sets are read from/saved to its
@@ -915,6 +1432,8 @@ class GatingApp(ttk.Frame):
             self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
         self._refresh_existing_listbox()
         self._refresh_strategy_combo()
+        self.ov_colors.clear()
+        self._refresh_overlay_file_list(select_paths=set())
         self._select_file_index(0)
         self.status_var.set(
             f"Experiment geladen: {len(self.fcs_paths)} FCS-Datei(en) aus '{root_dir}'. "
@@ -958,11 +1477,20 @@ class GatingApp(ttk.Frame):
         if self.stat_channel_b_var.get() not in channels:
             self.stat_channel_b_var.set(channels[1] if len(channels) > 1 else channels[0])
 
+        self.ov_channel_a_combo["values"] = channels
+        self.ov_channel_b_combo["values"] = channels
+        if self.ov_channel_a_var.get() not in channels:
+            self.ov_channel_a_var.set(channels[0])
+        if self.ov_channel_b_var.get() not in channels:
+            self.ov_channel_b_var.set(channels[1] if len(channels) > 1 else channels[0])
+
         tab_idx = self.notebook.index(self.notebook.select())
         if tab_idx == 1:
             self._redraw_kinetics()
         elif tab_idx == 2:
             self._redraw_stats()
+        elif tab_idx == 3:
+            self._redraw_overlay()
 
     def _on_file_selected(self, _event):
         sel = self.file_listbox.curselection()
@@ -996,6 +1524,7 @@ class GatingApp(ttk.Frame):
         for combo, var in (
             (self.kin_gate_source_combo, self.kin_gate_source_var),
             (self.stat_gate_source_combo, self.stat_gate_source_var),
+            (self.ov_gate_source_combo, self.ov_gate_source_var),
         ):
             combo["values"] = values
             if var.get() not in values:
@@ -1017,11 +1546,15 @@ class GatingApp(ttk.Frame):
         to restrict) would get that deep restriction baked back in, making
         'go to parent'/'show sibling' look stuck showing the child's
         population instead of their own."""
-        if not self.show_existing_var.get() or not self.current_path:
+        if not self.current_path:
             return np.ones(len(df), dtype=bool)
-        if self.gate_tree["root"].children:
+        return self._base_mask_for(df, os.path.basename(self.current_path))
+
+    def _base_mask_for(self, df, filename: str) -> np.ndarray:
+        """_base_mask for an arbitrary file (used by the overlay tab, which
+        applies the live tree to several files at once)."""
+        if not self.show_existing_var.get() or self.gate_tree["root"].children:
             return np.ones(len(df), dtype=bool)
-        filename = os.path.basename(self.current_path)
         applicable = resolve_gate_sets_for_file(filename, self.existing_gate_sets)
         mask = np.ones(len(df), dtype=bool)
         for gs in applicable:
@@ -1123,65 +1656,178 @@ class GatingApp(ttk.Frame):
         y_out = ((y_raw < y_lo) | (y_raw > y_hi)) if y_manual else np.zeros(len(df), dtype=bool)
         out_of_range = (x_out | y_out) & view_mask
 
-        hist_range = None
-        if x_manual or y_manual:
-            xr = [x_lo, x_hi] if x_manual else [float(np.min(x_plot[view_mask])), float(np.max(x_plot[view_mask]))]
-            yr = [y_lo, y_hi] if y_manual else [float(np.min(y_plot[view_mask])), float(np.max(y_plot[view_mask]))]
-            hist_range = [xr, yr]
+        value_range = [[x_lo, x_hi] if x_manual else None, [y_lo, y_hi] if y_manual else None]
+        is_hist = plot_type == HIST_1D
 
         self.ax.clear()
-        if plot_type == "Scatter":
-            self.ax.scatter(x_plot[view_mask], y_plot[view_mask], s=2, color="tab:blue")
-        elif plot_type == "Histogram":
-            self.ax.hist2d(x_plot[view_mask], y_plot[view_mask], bins=150, cmap="viridis", range=hist_range)
-        elif plot_type == "Density":
-            self._plot_density(self.ax, x_plot[view_mask], y_plot[view_mask], value_range=hist_range)
-        elif plot_type == "Contour":
-            self._plot_contour(self.ax, x_plot[view_mask], y_plot[view_mask], value_range=hist_range)
+        self.ax.set_facecolor("white")
+        if is_hist:
+            n_out = self._plot_histogram_1d(
+                df, view_mask, x_raw, x_ch, x_lo if x_manual else None, x_hi if x_manual else None
+            )
+        else:
+            xv, yv = x_plot[view_mask], y_plot[view_mask]
+            if plot_type == "Scatter":
+                self.ax.scatter(xv, yv, s=1, color="#1f4e8c", alpha=0.5, linewidths=0, rasterized=True)
+            elif plot_type == "Pseudocolor":
+                self._plot_pseudocolor(self.ax, xv, yv, x_ch, y_ch, value_range, sigma=0.0)
+            elif plot_type == "Density":
+                self._plot_pseudocolor(self.ax, xv, yv, x_ch, y_ch, value_range, sigma=2.0)
+            elif plot_type == "Contour":
+                self._plot_contour(self.ax, xv, yv, x_ch, y_ch, value_range)
+            self._overlay_child_shapes(self.ax, x_ch, y_ch)
+            n_out = int(out_of_range.sum())
 
-        self._overlay_child_shapes(self.ax, x_ch, y_ch)
-        self._apply_axis_transforms(x_ch, y_ch)
+        self._apply_axis_transforms(x_ch, y_ch, y_linear=is_hist)
         if x_manual:
             self.ax.set_xlim(x_lo, x_hi)
-        if y_manual:
+        if y_manual and not is_hist:
             self.ax.set_ylim(y_lo, y_hi)
-        self._overlay_quadrant_preview(self.ax, x_ch, y_ch)
 
-        n_out = int(out_of_range.sum())
-        if n_out:
-            self.ax.scatter(
-                x_plot[out_of_range], y_plot[out_of_range], marker="x", s=45, color="red",
-                linewidths=1.8, zorder=6,
-            )
+        if not is_hist:
+            self._overlay_quadrant_preview(self.ax, x_ch, y_ch)
+            if n_out:
+                self.ax.scatter(
+                    x_plot[out_of_range], y_plot[out_of_range], marker="x", s=45, color="red",
+                    linewidths=1.8, zorder=6,
+                )
 
         self.ax.set_xlabel(x_ch)
-        self.ax.set_ylabel(y_ch)
+        self.ax.set_ylabel("Events / Bin" if is_hist else y_ch)
         node_name = self.gate_tree[self.current_node_id].name
         title_pop = f"{node_name}: {int(view_mask.sum())}/{len(df)} Events"
         if n_out:
-            title_pop += f"  |  {n_out} außerhalb der Achsen-Grenzen (rot ×)"
+            title_pop += f"  |  {n_out} außerhalb der Achsen-Grenzen" + ("" if is_hist else " (rot ×)")
         self.ax.set_title(f"{os.path.basename(self.current_path)}\n{title_pop}")
         self.canvas.draw_idle()
         self._update_breadcrumb()
         self._refresh_gate_tree_view(df)
 
-    @staticmethod
-    def _hist2d_grid(x, y, bins=150, value_range=None):
-        H, xedges, yedges = np.histogram2d(x, y, bins=bins, range=value_range)
-        return H, xedges, yedges
+    # ---- 2D density plots -------------------------------------------------
+    # All 2D density views bin in DISPLAY space (after the Log/Logicle axis
+    # transform), so each bin is the same size on screen — binning raw values
+    # on a log axis gives giant smeared cells left and invisible ones right.
+    # Colors use a LOG scale: with a linear scale the debris/noise peak takes
+    # the whole top of the colormap and every real population drowns in the
+    # darkest color. Empty bins stay white so population borders are visible.
+    def _colormap(self):
+        name = COLORMAPS.get(self.colormap_var.get(), "turbo")
+        base = matplotlib.colormaps[name]
+        # Skip the near-black/near-white end so the LOWEST density is still a
+        # clearly visible color (not mistaken for "dense" or for background).
+        start = {"turbo": 0.12, "Blues": 0.25, "Greys": 0.25}.get(name, 0.0)
+        cmap = ListedColormap(base(np.linspace(start, 1.0, 256)), name=f"{name}_trunc")
+        cmap.set_bad("white")
+        cmap.set_under("white")
+        return cmap
 
-    def _plot_density(self, ax, x, y, bins=150, sigma=1.5, value_range=None):
-        H, xedges, yedges = self._hist2d_grid(x, y, bins=bins, value_range=value_range)
-        Hs = gaussian_filter(H, sigma=sigma)
-        ax.pcolormesh(xedges, yedges, Hs.T, cmap="viridis", shading="auto")
+    def _density_grid(self, x, y, x_ch, y_ch, value_range, bins=200, sigma=0.0):
+        tx = self._display_transform(self.x_transform_var.get(), x_ch)
+        ty = self._display_transform(self.y_transform_var.get(), y_ch)
+        xt, yt = tx.forward(x), ty.forward(y)
+        ok = np.isfinite(xt) & np.isfinite(yt)
+        xt, yt = xt[ok], yt[ok]
 
-    def _plot_contour(self, ax, x, y, bins=150, sigma=1.5, levels=12, value_range=None):
-        H, xedges, yedges = self._hist2d_grid(x, y, bins=bins, value_range=value_range)
-        Hs = gaussian_filter(H, sigma=sigma)
-        xc = (xedges[:-1] + xedges[1:]) / 2
-        yc = (yedges[:-1] + yedges[1:]) / 2
-        ax.contourf(xc, yc, Hs.T, levels=levels, cmap="viridis")
-        ax.contour(xc, yc, Hs.T, levels=levels, colors="k", linewidths=0.3, alpha=0.5)
+        def rng(vals, tr, manual):
+            if manual is not None:
+                lo, hi = tr.forward(manual)
+            elif len(vals):
+                lo, hi = float(vals.min()), float(vals.max())
+            else:
+                lo, hi = 0.0, 1.0
+            return (lo, hi) if hi > lo else (lo, lo + 1.0)
+
+        H, xe_t, ye_t = np.histogram2d(
+            xt, yt, bins=bins, range=[rng(xt, tx, value_range[0]), rng(yt, ty, value_range[1])]
+        )
+        if sigma > 0:
+            H = gaussian_filter(H, sigma=sigma)
+        return {
+            "H": H, "xe": tx.inverse(xe_t), "ye": ty.inverse(ye_t),
+            "xc": tx.inverse((xe_t[:-1] + xe_t[1:]) / 2), "yc": ty.inverse((ye_t[:-1] + ye_t[1:]) / 2),
+            "xe_t": xe_t, "ye_t": ye_t, "xt": xt, "yt": yt, "ok": ok,
+        }
+
+    def _plot_pseudocolor(self, ax, x, y, x_ch, y_ch, value_range, sigma=0.0):
+        g = self._density_grid(x, y, x_ch, y_ch, value_range, bins=200, sigma=sigma)
+        H = g["H"]
+        if not (H > 0).any():
+            return
+        # Smoothed: one isolated event peaks at ~1/(2πσ²) (≈0.04 for σ=2);
+        # a floor above that keeps lone outliers from becoming big blobs.
+        floor = 1.0 if sigma == 0 else max(2.5 / (2 * np.pi * sigma**2), float(H.max()) * 1e-4)
+        masked = np.ma.masked_less(H, floor)
+        ax.pcolormesh(
+            g["xe"], g["ye"], masked.T, cmap=self._colormap(),
+            norm=LogNorm(vmin=floor, vmax=max(float(H.max()), floor * 1.01)), shading="flat", rasterized=True,
+        )
+
+    CONTOUR_PROBABILITIES = (0.98, 0.95, 0.90, 0.75, 0.50, 0.25, 0.10)
+
+    def _plot_contour(self, ax, x, y, x_ch, y_ch, value_range):
+        """Equal-probability contours (like FlowJo): each line encloses the
+        given share of the events, e.g. the '50%' line surrounds the densest
+        half. Events outside the outermost line are drawn as grey dots so
+        sparse populations don't silently vanish."""
+        g = self._density_grid(x, y, x_ch, y_ch, value_range, bins=200, sigma=2.0)
+        H = g["H"]
+        total = float(H.sum())
+        if total <= 0:
+            return
+        flat = np.sort(H.ravel())[::-1]
+        cum = np.cumsum(flat) / total
+        level_to_pct = {}
+        for p in self.CONTOUR_PROBABILITIES:
+            thr = float(flat[min(np.searchsorted(cum, p), len(flat) - 1)])
+            if thr > 0 and thr not in level_to_pct:
+                level_to_pct[thr] = p
+        levels = sorted(level_to_pct)
+        if not levels:
+            return
+
+        ix = np.clip(np.digitize(g["xt"], g["xe_t"]) - 1, 0, H.shape[0] - 1)
+        iy = np.clip(np.digitize(g["yt"], g["ye_t"]) - 1, 0, H.shape[1] - 1)
+        outlier = H[ix, iy] < levels[0]
+        xs, ys = np.asarray(x)[g["ok"]], np.asarray(y)[g["ok"]]
+        ax.scatter(xs[outlier], ys[outlier], s=1.5, color="#8a8a8a", alpha=0.6, linewidths=0, rasterized=True)
+
+        if len(levels) == 1:
+            cs = ax.contour(g["xc"], g["yc"], H.T, levels=levels, colors=["#1f4e8c"], linewidths=1.3)
+        else:
+            cs = ax.contour(  # floor avoids LogNorm's "z <= 0 masked" warning; below levels[0] anyway
+                g["xc"], g["yc"], np.maximum(H, levels[0] * 1e-3).T, levels=levels, cmap=self._colormap(),
+                norm=LogNorm(vmin=levels[0], vmax=levels[-1]), linewidths=1.3,
+            )
+        ax.clabel(cs, fmt={lv: f"{level_to_pct[lv] * 100:.0f}%" for lv in levels}, fontsize=7, inline=True)
+
+    def _plot_histogram_1d(self, df, view_mask, x_raw, x_ch, lo, hi) -> int:
+        """Intensity (X channel) vs. number of events, as lines: the current
+        population filled in grey, every child gate's sub-population as a
+        line in that gate's color (same color as its outline in 2D plots).
+        Returns the number of events outside the manual X limits."""
+        node = self.gate_tree[self.current_node_id]
+        series = [OverlaySeries(node.name, x_raw[view_mask & np.isfinite(x_raw)], "#555555")]
+        n_parent = max(int(view_mask.sum()), 1)
+        for i, child_id in enumerate(node.children):
+            child = self.gate_tree[child_id]
+            m = view_mask & child.step.mask(df) & np.isfinite(x_raw)
+            series.append(OverlaySeries(
+                f"{child.name}  ({int(m.sum())}, {100.0 * m.sum() / n_parent:.1f}%)", x_raw[m], default_color(i)
+            ))
+        tr = self._display_transform(self.x_transform_var.get(), x_ch)
+        result = compute_overlay(series, tr, n_bins=256, lo=lo, hi=hi, normalization=NORM_COUNT, smooth_sigma=1.0)
+        x = result.centers_raw
+        parent_y = result.curves[0]
+        self.ax.fill_between(x, 0, parent_y, color="#bbbbbb", alpha=0.5, linewidth=0)
+        self.ax.plot(x, parent_y, color="#333333", linewidth=1.5, label=f"{node.name}  ({int(view_mask.sum())})")
+        for s, y in zip(series[1:], result.curves[1:]):
+            self.ax.plot(x, y, color=s.color, linewidth=1.6, label=s.label)
+        y_max = max((float(c.max()) for c in result.curves if len(c)), default=1.0)
+        self.ax.set_ylim(0, (y_max or 1.0) * 1.05)
+        if len(x):
+            self.ax.set_xlim(lo if lo is not None else x[0], hi if hi is not None else x[-1])
+        self.ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
+        return result.n_out_of_range[0]
 
     def _channel_range(self, channel: str) -> float:
         fcs = self._get_data(self.current_path)
@@ -1191,7 +1837,7 @@ class GatingApp(ttk.Frame):
         col = fcs.df[channel]
         return float(col.max()) if len(col) else 262144.0
 
-    def _apply_axis_transforms(self, x_ch: str, y_ch: str):
+    def _scale_params(self) -> dict:
         try:
             linthresh = float(self.log_linthresh_var.get())
         except ValueError:
@@ -1204,16 +1850,17 @@ class GatingApp(ttk.Frame):
             logicle_m = float(self.logicle_m_var.get())
         except ValueError:
             logicle_m = 4.5
+        return {"log_linthresh": linthresh, "logicle_w": logicle_w, "logicle_m": logicle_m}
 
+    def _display_transform(self, transform_name: str, channel: str) -> DisplayTransform:
+        return DisplayTransform(transform_name, channel_range=self._channel_range(channel), **self._scale_params())
+
+    def _apply_axis_transforms(self, x_ch: str, y_ch: str, y_linear: bool = False):
+        params = self._scale_params()
+        apply_axis_scale(self.ax, "x", self.x_transform_var.get(), channel_range=self._channel_range(x_ch), **params)
         apply_axis_scale(
-            self.ax, "x", self.x_transform_var.get(),
-            channel_range=self._channel_range(x_ch), log_linthresh=linthresh,
-            logicle_w=logicle_w, logicle_m=logicle_m,
-        )
-        apply_axis_scale(
-            self.ax, "y", self.y_transform_var.get(),
-            channel_range=self._channel_range(y_ch), log_linthresh=linthresh,
-            logicle_w=logicle_w, logicle_m=logicle_m,
+            self.ax, "y", "Linear" if y_linear else self.y_transform_var.get(),
+            channel_range=self._channel_range(y_ch), **params,
         )
 
     @staticmethod
@@ -1265,21 +1912,30 @@ class GatingApp(ttk.Frame):
         """Draw outlines of the current node's child gates that use this exact
         channel pair, as a visual reference on top of any plot type — also
         what you double-click on to navigate into that child population."""
+        # Each child gate gets its own color (same index -> same color as its
+        # line in the 1D histogram), with a white halo so outline and label
+        # stay readable on top of any colormap.
+        halo_line = [patheffects.withStroke(linewidth=3.5, foreground="white")]
+        halo_text = [patheffects.withStroke(linewidth=2.5, foreground="white")]
         drawn_quadrant_centers = set()
-        for child_id in self.gate_tree[self.current_node_id].children:
+        for i, child_id in enumerate(self.gate_tree[self.current_node_id].children):
             step = self.gate_tree[child_id].step
             if step.x_channel != x_ch or step.y_channel != y_ch:
                 continue
+            color = default_color(i)
+            label_kw = dict(ha="center", fontsize=8, fontweight="bold", path_effects=halo_text, zorder=8)
             if step.shape == "quadrant":
                 p = step.params
                 key = (p["cx"], p["cy"], p.get("angle_deg", 0.0))
                 if key not in drawn_quadrant_centers:
                     drawn_quadrant_centers.add(key)
-                    self._draw_quadrant_lines(ax, p["cx"], p["cy"], p.get("angle_deg", 0.0), color="red")
+                    self._draw_quadrant_lines(
+                        ax, p["cx"], p["cy"], p.get("angle_deg", 0.0), color="black", path_effects=halo_line
+                    )
                 cx, cy = self._quadrant_label_position(ax, p)
-                ax.annotate(self.gate_tree[child_id].name, (cx, cy), color="red", ha="center", fontsize=8)
+                ax.annotate(self.gate_tree[child_id].name, (cx, cy), color=color, **label_kw)
                 continue
-            patch = self._shape_patch(step, edgecolor="red", linewidth=1.5)
+            patch = self._shape_patch(step, edgecolor=color, linewidth=1.8, path_effects=halo_line, zorder=7)
             if patch is None:
                 continue
             ax.add_patch(patch)
@@ -1287,7 +1943,7 @@ class GatingApp(ttk.Frame):
                 cx, cy = step.params["cx"], step.params["cy"]
             else:
                 cx, cy = patch.get_path().vertices.mean(axis=0)
-            ax.annotate(self.gate_tree[child_id].name, (cx, cy), color="red", ha="center", fontsize=8)
+            ax.annotate(self.gate_tree[child_id].name, (cx, cy), color=color, **label_kw)
 
     def _overlay_quadrant_preview(self, ax, x_ch: str, y_ch: str):
         """While a quadrant gate is being placed: once its center is picked,
@@ -1462,6 +2118,8 @@ class GatingApp(ttk.Frame):
 
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
+        if self.plot_type_var.get() == HIST_1D:
+            return  # Y is event count here, not a channel — gate hit-tests would be meaningless
         x_ch, y_ch = self.x_channel_var.get(), self.y_channel_var.get()
 
         # Double-click INSIDE a child gate's shape: navigate into it.
@@ -1564,6 +2222,8 @@ class GatingApp(ttk.Frame):
         self.x_channel_var.set(step.x_channel)
         self.y_channel_var.set(step.y_channel)
         self.shape_var.set(shape_label)
+        if self.plot_type_var.get() == HIST_1D:
+            self.plot_type_var.set("Pseudocolor")
         self._redraw()  # current_node_id (the parent) is unchanged, just refresh for the channel pair
 
         self.editing_node_id = node_id
@@ -1738,6 +2398,7 @@ class GatingApp(ttk.Frame):
     def _start_drawing(self):
         if self.active_selector is not None or self._picking_point_center:
             return
+        self._ensure_2d_plot_for_gating()
         self.editing_node_id = None
         self.finish_button.configure(text="Schritt übernehmen")
         fcs = self._get_data(self.current_path)
