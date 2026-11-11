@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 import flowkit as fk
@@ -38,6 +39,14 @@ def load_fcs(path: str) -> FcsData:
 
 _RESERVED_SUBDIRS = {"gates", "exports"}
 
+_NUM_RE = re.compile(r"(\d+)")
+
+
+def natural_sort_key(s: str):
+    """Sort key that orders embedded numbers numerically ('A2' < 'A10'),
+    case-insensitively, instead of character by character."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t.lower()) for t in _NUM_RE.split(s)]
+
 
 def find_fcs_files(input_dir: str, recursive: bool = False) -> list[str]:
     """List .fcs files directly in input_dir, or (recursive=True) anywhere
@@ -51,11 +60,11 @@ def find_fcs_files(input_dir: str, recursive: bool = False) -> list[str]:
             files.extend(
                 os.path.join(root, f) for f in filenames if f.lower().endswith(".fcs")
             )
-        files.sort()
+        files.sort(key=natural_sort_key)
     else:
         files = [
             os.path.join(input_dir, f)
-            for f in sorted(os.listdir(input_dir))
+            for f in sorted(os.listdir(input_dir), key=natural_sort_key)
             if f.lower().endswith(".fcs")
         ]
     if not files:
