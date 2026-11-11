@@ -1,5 +1,25 @@
+# Messdaten und Ergebnisse (nicht ins Repo)
 *.fcs
-*.pyc
 *.csv
-
 *.png
+output/
+exports/
+
+# Bilder für die Doku dürfen rein
+!docs/**/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editor / Betriebssystem
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

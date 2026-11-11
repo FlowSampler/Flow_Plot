@@ -1,25 +1,73 @@
-# Ca2+ Kinetik Pipeline
+# Flow_Plot
 
-Analysiert alle `.fcs`-Dateien in `Ca2+_kinetic/`:
-1. Pregating (Zellpopulation von Interesse, flexibel: global / Gruppe / einzelne Datei)
-2. Ratio zweier Marker (`PerCP-A / Qdot 655-A`) pro Event
-3. Zeit-gebinnte Kinetik (Median-Ratio je Zeitfenster) als Plot + CSV pro Datei
+Gating, Ca²⁺-Kinetik und Histogramm-Overlays für Durchflusszytometrie-Daten (`.fcs`) —
+eine freie, Python-basierte Alternative für typische FlowJo-Arbeitsschritte, mit grafischer
+Oberfläche (Tkinter + Matplotlib) und einer Batch-Pipeline für die Kommandozeile.
 
-## Setup
+## Funktionen
 
-Die Pipeline braucht `flowkit`, `pandas`, `numpy`, `matplotlib`. Diese sind bereits in der
-conda-Umgebung **"standard"** installiert:
+- **Gating** wie in FlowJo: hierarchischer Gate-Baum (Polygon / Rechteck / Ellipse), Gate-Sets
+  speicherbar für alle Dateien, eine Gruppe oder eine einzelne Datei
+- **Darstellungen**: Scatter, 2D-Histogramm, Dichte, Konturen; Achsen Linear / Log / Logicle
+- **Kinetik**: Einzelkanal oder Ratio zweier Kanäle über die Zeit (Median/Mittelwert pro Bin,
+  Einzel-Events, Dichte, Ridgeline pro Zeitfenster)
+- **Statistik**: Count / %positiv / %negativ pro Datei oder für die ganze Kohorte
+- **Histogramm-Overlay** mehrerer Dateien (übereinander, versetzt, gestaffelt, getrennte Panels)
+- **Export** als CSV/PNG, Plots per Klick in die Zwischenablage (Strg+V in PowerPoint/Word)
 
-```
-C:\Users\sah\AppData\Local\miniconda3\envs\standard\python.exe
-```
+## Installation
 
-Der System-`python` (3.14, `C:\Python314\python.exe`) hat diese Pakete NICHT. Entweder
-immer den vollen Pfad benutzen, oder vorher aktivieren:
+Voraussetzung: **Python 3.10 oder neuer** (getestet mit 3.13). Tkinter ist in den
+Python-Installern von python.org und in Anaconda bereits enthalten.
 
 ```powershell
-conda activate standard
+git clone https://github.com/FlowSampler/Flow_Plot.git
+cd Flow_Plot
+python -m venv .venv
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+Alternativ mit conda:
+
+```powershell
+conda create -n flow_plot python=3.13
+conda activate flow_plot
+pip install -r requirements.txt
+```
+
+**Plattform:** entwickelt und getestet unter Windows. „Plot in Zwischenablage kopieren“
+nutzt die Windows-Zwischenablage (`pywin32`) und funktioniert nur dort; alles andere ist
+reines Python und sollte auch unter macOS/Linux laufen.
+
+## Projektstruktur
+
+```
+Flow_Plot/
+├── pipeline/
+│   ├── gating_gui.py         # GUI (Gating, Kinetik, Statistik, Histogramm-Overlay)
+│   ├── run_pipeline.py       # Batch-Auswertung aller Dateien (Kommandozeile)
+│   ├── define_gates.py       # Gates per Kommandozeile definieren (nur Polygon)
+│   ├── gating.py             # Gate-Sets: Datenmodell, Laden/Speichern, Anwenden
+│   ├── kinetics.py           # Ratio, Zeit-Binning, Kinetik- und Ridgeline-Plots
+│   ├── histogram_overlay.py  # Histogramm-Overlays mehrerer Dateien
+│   ├── transforms.py         # Achsen-Transformationen (Linear / Log / Logicle)
+│   ├── io_utils.py           # FCS-Dateien finden und laden
+│   └── clipboard_utils.py    # Plot → Windows-Zwischenablage
+├── gates/                    # gespeicherte Gate-Sets (JSON)
+├── Ca2+_kinetic/             # eigene .fcs-Dateien hier ablegen (nicht im Repo)
+├── output/                   # Ergebnisse der Pipeline (nicht im Repo)
+└── requirements.txt
+```
+
+Messdaten (`*.fcs`) und Ergebnisse (`*.csv`, `*.png`, `output/`) werden per `.gitignore`
+bewusst **nicht** versioniert. Die Standard-Ordner lassen sich über `--input-dir`,
+`--gates-dir` und `--output-dir` beliebig ändern; in der GUI kann der Datenordner auch direkt
+gewählt werden.
+
+**Dateinamen-Konvention:** Steht im Dateinamen `baseline <N>` (z.B.
+`MEC-1 baseline 60 + Lysate.fcs`), wird das als Baseline-/Stimulus-Zeitpunkt in Sekunden
+gelesen — er wird in den Kinetik-Plots markiert und für Fold-Change und Ridgeline-Farben genutzt.
 
 ## Schritt 1: Pregates definieren
 
@@ -147,6 +195,9 @@ Gates sofort zu kontrollieren, ganz ohne die Batch-Pipeline zu starten:
 - **Ratio (Kanal A / Kanal B)**: z.B. `PerCP-A / Qdot 655-A`, mit einstellbarem "Min. Signal"
   (Rausch-Ausschluss) wie in der Batch-Pipeline
 - **Bin-Breite** einstellbar, rote Linie markiert das erkannte Ende der Baseline
+- **Darstellung**: Median oder Mittelwert pro Bin (± SEM), Einzel-Events als Punkte oder als
+  Dichte-Heatmap, oder **Ridgeline** (eine Verteilung pro Zeitfenster, Kämme vor/nach dem
+  Stimulus unterschiedlich eingefärbt)
 - **"Population:"-Dropdown** — wählt explizit, welche Population gemeint ist:
   - **Live (Gating-Tab-Ansicht)**: die Population, die gerade im Gating-Tab angezeigt wird
     (gespeicherte Gate-Sets + gerade gezeichnete, noch nicht gespeicherte Schritte) — nur für
@@ -196,6 +247,23 @@ pro Einzeldatei oder für die gesamte Kohorte — exportierbar als CSV.
   "Live") und zeigt sie als Tabelle unten im Fenster
 - **"Als CSV exportieren"**: speichert die zuletzt berechnete Kohorten-Tabelle über einen
   Datei-Dialog
+
+### Histogramm-Overlay-Tab (direkt in der GUI)
+
+Vierter Tab **"Histogramm-Overlay"**: die Verteilung eines Kanals oder Ratios für mehrere
+Dateien in einem Plot vergleichen.
+
+- Dateien links auswählen (Strg/Shift-Klick für Mehrfachauswahl, "Name enthält" zum Filtern)
+- **Darstellung**: Overlay (übereinander), Offset (vertikal versetzt), Staggered (vertikal +
+  horizontal versetzt) oder Getrennt (ein Panel je Datei)
+- **Normierung**, Bins, Glättung, X-Transform und X-Achsen-Bereich einstellbar
+- **Population**: wie im Kinetik-Tab; "Live" wendet den aktuell angezeigten Knoten des
+  Gate-Baums auf jede Datei an
+- **Farben**: pro Datei (Doppelklick auf die Datei), eine Einheitsfarbe oder ein Farbverlauf
+- Export der Histogramm-Daten als CSV oder des Plots in die Zwischenablage
+
+Einstellungen, die für die gewählte Darstellung keine Wirkung haben (z.B. "Offset Y" bei
+"Overlay"), werden in allen Tabs automatisch ausgeblendet.
 
 ### Option B: CLI (nicht-interaktiv, nur Polygon)
 
@@ -266,3 +334,19 @@ Zusätzlich:
   Gates definiert werden.
 - Die Zeitachse (`Time`-Kanal) ist bereits in Sekunden (FlowKit skaliert automatisch mit
   `$TIMESTEP` aus der FCS-Datei).
+
+## Abhängigkeiten
+
+Das Einlesen der FCS-Dateien und die Logicle-Transformation basieren auf
+[FlowKit](https://github.com/whitews/FlowKit). Alle Pakete stehen in `requirements.txt`.
+
+## Lizenz
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — Nutzung, Änderung und Weitergabe sind für
+**nicht-kommerzielle Zwecke** frei erlaubt: private Nutzung, Forschung und Lehre sowie
+Hochschulen, öffentliche Forschungseinrichtungen und gemeinnützige Organisationen
+(unabhängig von deren Finanzierung). **Kommerzielle Nutzung** ist nicht gestattet — bei
+Interesse bitte über ein GitHub-Issue Kontakt aufnehmen.
+
+Bei Weitergabe müssen der Lizenztext und die Zeile `Required Notice: …` aus `LICENSE.md`
+mitgegeben werden.
