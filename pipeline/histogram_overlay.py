@@ -24,7 +24,32 @@ from scipy.ndimage import gaussian_filter1d
 
 from transforms import apply_axis_scale
 
-MODES = ["Overlay", "Offset", "Staggered", "Getrennt (Panels)"]
+MODE_RIDGELINE = "Ridgeline"
+MODES = ["Overlay", "Offset", "Staggered", MODE_RIDGELINE, "Getrennt (Panels)"]
+
+# Color schemes for the curves. "Dateifarben" = per-file colors (default
+# palette, overridable by double-click); "Einheitsfarbe" = one user-picked
+# color for every curve; the rest are matplotlib colormaps sampled evenly
+# from first to last curve (classic ridgeline gradient look).
+SCHEME_FILE = "Dateifarben (Doppelklick)"
+SCHEME_SINGLE = "Einheitsfarbe"
+COLORMAP_SCHEMES = {
+    "Verlauf: Viridis": "viridis",
+    "Verlauf: Magma": "magma",
+    "Verlauf: Plasma": "plasma",
+    "Verlauf: Cividis": "cividis",
+    "Verlauf: Blau": "Blues",
+    "Verlauf: Rot": "Reds",
+    "Verlauf: Grün": "Greens",
+    "Verlauf: Spectral": "Spectral",
+    "Verlauf: Coolwarm": "coolwarm",
+}
+COLOR_SCHEMES = [SCHEME_FILE, SCHEME_SINGLE, *COLORMAP_SCHEMES]
+
+EDGE_SAME = "wie Füllung (dunkler)"
+EDGE_BLACK = "Schwarz"
+EDGE_WHITE = "Weiß"
+EDGE_COLORS = [EDGE_SAME, EDGE_BLACK, EDGE_WHITE]
 NORM_MODE = "% vom Maximum (Modus)"
 NORM_COUNT = "Anzahl Events"
 NORM_PERCENT = "% der Events pro Bin"
@@ -39,6 +64,33 @@ DEFAULT_COLORS = [
 
 def default_color(index: int) -> str:
     return DEFAULT_COLORS[index % len(DEFAULT_COLORS)]
+
+
+def scheme_colors(n: int, scheme: str, single_color: str = "#1f77b4") -> list[str] | None:
+    """Colors for n curves under a color scheme, or None for SCHEME_FILE
+    (= keep each file's own color). Colormaps are sampled in 0.15..0.85 so
+    neither end is near-white/near-black and invisible on the background."""
+    if scheme == SCHEME_SINGLE:
+        return [single_color] * n
+    cmap_name = COLORMAP_SCHEMES.get(scheme)
+    if cmap_name is None:
+        return None
+    import matplotlib
+    from matplotlib.colors import to_hex
+
+    cmap = matplotlib.colormaps[cmap_name]
+    pos = np.linspace(0.15, 0.85, n) if n > 1 else np.array([0.5])
+    return [to_hex(cmap(p)) for p in pos]
+
+
+def _edge_color(fill_color: str, edge: str) -> str:
+    if edge == EDGE_BLACK:
+        return "#000000"
+    if edge == EDGE_WHITE:
+        return "#ffffff"
+    from matplotlib.colors import to_hex, to_rgb
+
+    return to_hex(tuple(0.6 * c for c in to_rgb(fill_color)))
 
 
 @dataclass
@@ -143,6 +195,36 @@ def _draw_curve(ax, x, y, base, color, fill, alpha, zorder, occlude, label=None,
     ax.plot(x, base + y, color=color, linewidth=linewidth, zorder=zorder + 0.5, label=label)
 
 
+def _draw_ridgeline(ax, series, curves, x, y_max, offset_frac, fill, alpha, legend_stats, edge):
+    """Classic ridgeline / joyplot: first series on top, each ridge on its
+    own baseline, ridges below overlap (and hide) the ones above when the
+    spacing (offset_frac of the tallest peak) is < 100 %. Fills are drawn
+    on an opaque background underlay so the overlap reads cleanly even with
+    semi-transparent colors. Labels sit on the left at each baseline; the
+    Y axis itself is hidden because its values are offsets, not data."""
+    n = len(series)
+    step = max(offset_frac, 0.05) * y_max
+    bases = [(n - 1 - i) * step for i in range(n)]  # series 0 -> top
+    for i in range(n):  # top (back) first, so lower ridges are drawn over it
+        s, y, base = series[i], curves[i], bases[i]
+        z = 2 + 3 * i
+        line_col = _edge_color(s.color, edge)
+        if fill:
+            ax.fill_between(x, base, base + y, color=ax.get_facecolor(), zorder=z, linewidth=0)
+            ax.fill_between(x, base, base + y, color=s.color, alpha=max(alpha, 0.0), zorder=z + 0.5, linewidth=0)
+        else:  # outline only: still hide what's behind so ridges stay separable
+            ax.fill_between(x, base, base + y, color=ax.get_facecolor(), zorder=z, linewidth=0)
+        ax.plot(x, base + y, color=line_col if fill else s.color, linewidth=1.3, zorder=z + 1)
+        ax.axhline(base, color=line_col if fill else s.color, linewidth=0.7, alpha=0.8, zorder=z + 1)
+        ax.text(-0.01, base, _short(_legend_label(s, legend_stats), 60), transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom", fontsize=8, color=_edge_color(s.color, EDGE_SAME), fontweight="bold",
+                clip_on=False)
+    ax.set_ylim(0, bases[0] + y_max * 1.08)
+    ax.set_yticks([])
+    for side in ("left", "right", "top"):
+        ax.spines[side].set_visible(False)
+
+
 def draw_overlay(
     fig: Figure,
     result: OverlayResult,
@@ -156,9 +238,11 @@ def draw_overlay(
     alpha: float = 0.35,
     legend_stats: bool = True,
     x_limits: tuple[float, float] | None = None,
+    edge: str = EDGE_SAME,
 ):
     """Draw into fig (cleared first). Series order = drawing order: the
-    first series is the bottom/front curve in Offset/Staggered modes."""
+    first series is the bottom/front curve in Offset/Staggered modes and
+    the TOP ridge in Ridgeline mode (reads like the file list)."""
     fig.clear()
     series, curves, x = result.series, result.curves, result.centers_raw
     n = len(series)
@@ -192,6 +276,14 @@ def draw_overlay(
 
     ax = fig.add_subplot(111)
     tr.apply_to(ax)
+
+    if mode == MODE_RIDGELINE:
+        _draw_ridgeline(ax, series, curves, x, y_max, offset_frac, fill, alpha, legend_stats, edge)
+        ax.set_xlim(lo_raw, hi_raw)
+        ax.set_xlabel(x_label)
+        if title:
+            ax.set_title(title, fontsize=10)
+        return
 
     if mode == "Overlay":
         for i, (s, y) in enumerate(zip(series, curves)):

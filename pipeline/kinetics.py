@@ -54,6 +54,110 @@ def bin_kinetics(time_s: pd.Series, ratio: pd.Series, bin_width_s: float = 1.0) 
     return pd.DataFrame(rows)
 
 
+KIN_DISPLAY_MEDIAN = "Median pro Bin (± SEM)"
+KIN_DISPLAY_MEAN = "Mittelwert pro Bin (± SEM)"
+KIN_DISPLAY_EVENTS = "Einzel-Events (Punkte)"
+KIN_DISPLAY_DENSITY = "Einzel-Events (Dichte)"
+KIN_DISPLAYS = [KIN_DISPLAY_MEDIAN, KIN_DISPLAY_MEAN, KIN_DISPLAY_EVENTS, KIN_DISPLAY_DENSITY]
+KIN_EVENT_DISPLAYS = (KIN_DISPLAY_EVENTS, KIN_DISPLAY_DENSITY)
+
+
+def event_values(time_s: pd.Series, values: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """Per-event (time, value) pairs with NaN/inf removed (e.g. ratio events
+    excluded by the minimum-signal filter)."""
+    t = np.asarray(time_s, dtype=float)
+    v = np.asarray(values, dtype=float)
+    ok = np.isfinite(t) & np.isfinite(v)
+    return t[ok], v[ok]
+
+
+def draw_kinetics(
+    ax,
+    binned: pd.DataFrame,
+    t: np.ndarray,
+    v: np.ndarray,
+    display: str = KIN_DISPLAY_MEDIAN,
+    summary_overlay: bool = True,
+    max_points: int = 200_000,
+    point_size: float = 2.0,
+    point_alpha: float = 0.3,
+    point_color: str = "#1f4e8c",
+    cmap=None,
+    y_limits: tuple[float | None, float | None] = (None, None),
+    baseline_end_s: float | None = None,
+) -> int:
+    """Draw a kinetic onto ``ax`` (not cleared here).
+
+    Binned modes: median or mean per time bin with SEM error bars.
+    Event modes: every event as a dot (randomly subsampled to ``max_points``
+    for speed, deterministic seed) or as a time x value density map; the
+    median per bin can be overlaid as a line. Returns the number of events
+    actually drawn (relevant for the subsampling note).
+    """
+    from matplotlib.colors import LogNorm
+
+    n_drawn = 0
+    if display in KIN_EVENT_DISPLAYS:
+        if display == KIN_DISPLAY_EVENTS and len(t):
+            if len(t) > max_points > 0:
+                idx = np.random.default_rng(0).choice(len(t), size=max_points, replace=False)
+                idx.sort()
+                ts, vs = t[idx], v[idx]
+            else:
+                ts, vs = t, v
+            ax.scatter(ts, vs, s=point_size, color=point_color, alpha=point_alpha,
+                       linewidths=0, rasterized=True, zorder=2)
+            n_drawn = len(ts)
+        elif display == KIN_DISPLAY_DENSITY and len(t):
+            # Y range: user limits if given, otherwise 0.5-99.5 % so a few
+            # extreme ratio outliers don't squash the whole population into one row.
+            y_lo, y_hi = y_limits
+            if y_lo is None or y_hi is None:
+                p_lo, p_hi = np.percentile(v, [0.5, 99.5])
+                y_lo = p_lo if y_lo is None else y_lo
+                y_hi = p_hi if y_hi is None else y_hi
+            if y_hi <= y_lo:
+                y_hi = y_lo + 1.0
+            t_lo, t_hi = float(t.min()), float(t.max())
+            if t_hi <= t_lo:
+                t_hi = t_lo + 1.0
+            H, xe, ye = np.histogram2d(t, v, bins=[150, 100], range=[[t_lo, t_hi], [y_lo, y_hi]])
+            Hm = np.ma.masked_where(H.T <= 0, H.T)
+            if Hm.count():
+                ax.pcolormesh(xe, ye, Hm, cmap=cmap or "turbo", norm=LogNorm(vmin=1, vmax=max(H.max(), 1)),
+                              shading="flat", rasterized=True, zorder=1)
+            n_drawn = int(H.sum())
+        if len(v) and (y_limits[0] is None or y_limits[1] is None):
+            # Auto Y for events: 0.5-99.5 % (+5 % margin) — a handful of extreme
+            # single-event ratios would otherwise squash the population flat.
+            p_lo, p_hi = np.percentile(v, [0.5, 99.5])
+            pad = 0.05 * (p_hi - p_lo or 1.0)
+            ax.set_ylim(p_lo - pad if y_limits[0] is None else y_limits[0],
+                        p_hi + pad if y_limits[1] is None else y_limits[1])
+        if summary_overlay and len(binned):
+            ax.plot(binned["time_bin_start_s"], binned["median_ratio"], color="black", linewidth=2.2, zorder=4)
+            ax.plot(binned["time_bin_start_s"], binned["median_ratio"], color="#ffd400", linewidth=1.2,
+                    zorder=5, label="Median pro Bin")
+    elif len(binned):
+        col = "median_ratio" if display == KIN_DISPLAY_MEDIAN else "mean_ratio"
+        ax.errorbar(binned["time_bin_start_s"], binned[col], yerr=binned["sem_ratio"],
+                    fmt="-o", markersize=3, linewidth=1, capsize=2)
+
+    if baseline_end_s is not None and (len(binned) or len(t)):
+        ax.axvline(baseline_end_s, color="red", linestyle="--", linewidth=1,
+                   label=f"Stimulus ({baseline_end_s:.0f}s)", zorder=6)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, loc="upper right")
+    return n_drawn
+
+
+def kinetics_y_label(base_label: str, display: str) -> str:
+    return {
+        KIN_DISPLAY_MEDIAN: f"{base_label} (Median pro Bin)",
+        KIN_DISPLAY_MEAN: f"{base_label} (Mittelwert pro Bin)",
+    }.get(display, f"{base_label} (pro Event)")
+
+
 def parse_baseline_duration_s(filename: str) -> float | None:
     """Extract a 'baseline <N>' duration (seconds) from a filename, if present."""
     m = re.search(r"baseline\s*(\d+(?:\.\d+)?)", filename, flags=re.IGNORECASE)

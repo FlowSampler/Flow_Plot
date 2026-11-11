@@ -56,18 +56,34 @@ from gating import (
 )
 from clipboard_utils import copy_figure_to_clipboard
 from histogram_overlay import (
+    COLOR_SCHEMES as OVERLAY_COLOR_SCHEMES,
+    EDGE_COLORS as OVERLAY_EDGE_COLORS,
+    MODE_RIDGELINE,
     MODES as OVERLAY_MODES,
     NORMALIZATIONS as OVERLAY_NORMALIZATIONS,
     NORM_COUNT,
+    SCHEME_FILE,
+    SCHEME_SINGLE,
     DisplayTransform,
     OverlaySeries,
     compute_overlay,
     default_color,
     draw_overlay,
+    scheme_colors,
 )
 from io_utils import FcsData, find_fcs_files, load_fcs
-from kinetics import bin_kinetics, compute_ratio, parse_baseline_duration_s, value_stats
-from run_pipeline import plot_kinetics
+from kinetics import (
+    KIN_DISPLAY_MEDIAN,
+    KIN_DISPLAYS,
+    KIN_EVENT_DISPLAYS,
+    bin_kinetics,
+    compute_ratio,
+    draw_kinetics,
+    event_values,
+    kinetics_y_label,
+    parse_baseline_duration_s,
+    value_stats,
+)
 from transforms import TRANSFORM_NAMES, apply_axis_scale
 
 SHAPES = ["Polygon", "Rectangle", "Ellipse", "Quadrant", "Quadrant (Winkel)"]
@@ -124,7 +140,10 @@ class GatingApp(ttk.Frame):
         self._kin_last_label = None
         self._kin_last_filename = None
         self._kin_last_population = None
+        self._kin_last_events = None  # (time_s, value) arrays of the last drawn kinetic
+        self.kin_point_color = "#1f4e8c"
         self.ov_colors: dict[str, str] = {}  # per-file color overrides for the overlay tab (path -> hex)
+        self.ov_single_color = "#1f77b4"  # curve color for the "Einheitsfarbe" scheme
         self._ov_redraw_job = None
         self._ov_last_result = None
 
@@ -645,6 +664,46 @@ class GatingApp(ttk.Frame):
             foreground="#555"
         ).grid(row=8, column=0, columnspan=9, sticky="w")
 
+        kin_disp_row = ttk.Frame(controls)
+        kin_disp_row.grid(row=9, column=0, columnspan=9, sticky="w", pady=(6, 0))
+        ttk.Label(kin_disp_row, text="Darstellung:").pack(side="left")
+        self.kin_display_var = tk.StringVar(value=KIN_DISPLAY_MEDIAN)
+        kin_disp_combo = ttk.Combobox(
+            kin_disp_row, textvariable=self.kin_display_var, state="readonly", values=KIN_DISPLAYS, width=26
+        )
+        kin_disp_combo.pack(side="left", padx=(4, 12))
+        kin_disp_combo.bind("<<ComboboxSelected>>", lambda e: self._on_kin_display_changed())
+        self.kin_overlay_median_var = tk.BooleanVar(value=True)
+        self.kin_event_widgets = [
+            ttk.Checkbutton(kin_disp_row, text="Median-Linie überlagern", variable=self.kin_overlay_median_var,
+                            command=self._redraw_kinetics),
+        ]
+        self.kin_point_size_var = tk.StringVar(value="2")
+        self.kin_point_alpha_var = tk.StringVar(value="0.3")
+        self.kin_max_points_var = tk.StringVar(value="200000")
+        for text, var in (("Punktgröße:", self.kin_point_size_var), ("Deckkraft:", self.kin_point_alpha_var),
+                          ("Max. Punkte:", self.kin_max_points_var)):
+            self.kin_event_widgets.append(ttk.Label(kin_disp_row, text=text))
+            self.kin_event_widgets.append(ttk.Entry(kin_disp_row, textvariable=var, width=8))
+            var.trace_add("write", lambda *a: self._redraw_kinetics())
+        self.kin_point_color_btn = tk.Button(
+            kin_disp_row, text="Punktfarbe…", command=self._kin_pick_point_color, bg=self.kin_point_color,
+            fg="white", activebackground=self.kin_point_color, relief="groove",
+        )
+        self.kin_event_widgets.append(self.kin_point_color_btn)
+        self.kin_event_widgets.append(ttk.Button(
+            kin_disp_row, text="Einzel-Events als CSV", command=self._export_kinetics_events_csv
+        ))
+        for w in self.kin_event_widgets:
+            w.pack(side="left", padx=(0, 6))
+        ttk.Label(
+            controls,
+            text="(Einzel-Events: jedes Event als Punkt über der Zeit — bei sehr vielen Events wird für die Anzeige "
+            "zufällig auf \"Max. Punkte\" reduziert, der CSV-Export enthält immer alle. \"Dichte\" zeigt alle Events als "
+            "Zeit×Wert-Heatmap im Farbschema des Gating-Tabs.)",
+            foreground="#555", wraplength=1000,
+        ).grid(row=10, column=0, columnspan=9, sticky="w")
+
         self.kin_figure = Figure(figsize=(8, 6))
         self.kin_ax = self.kin_figure.add_subplot(111)
         self.kin_canvas = FigureCanvasTkAgg(self.kin_figure, master=parent)
@@ -657,6 +716,43 @@ class GatingApp(ttk.Frame):
         ttk.Label(parent, textvariable=self.kin_status_var, anchor="w").pack(fill="x", padx=4, pady=(0, 4))
 
         self._update_kin_mode()
+        self._on_kin_display_changed(redraw=False)
+
+    def _on_kin_display_changed(self, redraw: bool = True):
+        is_events = self.kin_display_var.get() in KIN_EVENT_DISPLAYS
+        for w in self.kin_event_widgets:
+            try:
+                w.configure(state="normal" if is_events else "disabled")
+            except tk.TclError:
+                pass
+        if redraw:
+            self._redraw_kinetics()
+
+    def _kin_pick_point_color(self):
+        from tkinter import colorchooser
+
+        _, hex_color = colorchooser.askcolor(color=self.kin_point_color, title="Farbe der Einzel-Events", parent=self)
+        if not hex_color:
+            return
+        self.kin_point_color = hex_color
+        self.kin_point_color_btn.configure(bg=hex_color, activebackground=hex_color)
+        self._redraw_kinetics()
+
+    def _kin_draw_options(self) -> dict:
+        """Display settings of the Kinetik tab as kwargs for draw_kinetics()."""
+        def num(var, default, lo, hi):
+            v = self._parse_optional_float(var.get())
+            return min(hi, max(lo, default if v is None else v))
+
+        return {
+            "display": self.kin_display_var.get(),
+            "summary_overlay": self.kin_overlay_median_var.get(),
+            "point_size": num(self.kin_point_size_var, 2.0, 0.1, 50.0),
+            "point_alpha": num(self.kin_point_alpha_var, 0.3, 0.01, 1.0),
+            "max_points": int(num(self.kin_max_points_var, 200000, 1000, 10_000_000)),
+            "point_color": self.kin_point_color,
+            "cmap": self._colormap(),
+        }
 
     def _update_kin_mode(self):
         is_ratio = self.kin_mode_var.get() == "ratio"
@@ -898,13 +994,38 @@ class GatingApp(ttk.Frame):
         ):
             v.trace_add("write", redraw)
 
+        color_row = ttk.Frame(controls)
+        color_row.grid(row=5, column=0, columnspan=10, sticky="w", pady=(6, 0))
+        ttk.Label(color_row, text="Farbschema:").pack(side="left")
+        self.ov_scheme_var = tk.StringVar(value=SCHEME_FILE)
+        scheme_combo = ttk.Combobox(
+            color_row, textvariable=self.ov_scheme_var, state="readonly", values=OVERLAY_COLOR_SCHEMES, width=24
+        )
+        scheme_combo.pack(side="left", padx=(4, 8))
+        scheme_combo.bind("<<ComboboxSelected>>", lambda e: self._on_overlay_scheme_changed())
+        self.ov_single_color_btn = tk.Button(
+            color_row, text="Einheitsfarbe wählen…", command=self._overlay_pick_single_color,
+            bg=self.ov_single_color, fg="white", activebackground=self.ov_single_color, relief="groove",
+        )
+        self.ov_single_color_btn.pack(side="left", padx=(0, 16))
+        ttk.Label(color_row, text="Kontur:").pack(side="left")
+        self.ov_edge_var = tk.StringVar(value=OVERLAY_EDGE_COLORS[0])
+        edge_combo = ttk.Combobox(
+            color_row, textvariable=self.ov_edge_var, state="readonly", values=OVERLAY_EDGE_COLORS, width=20
+        )
+        edge_combo.pack(side="left", padx=(4, 8))
+        edge_combo.bind("<<ComboboxSelected>>", redraw)
+        ttk.Label(color_row, text="(Kontur gilt für Ridgeline)", foreground="#555").pack(side="left")
+
         ttk.Label(
             controls,
-            text="Overlay = übereinander · Offset = vertikal versetzt (Ridgeline) · Staggered = vertikal + "
-            "horizontal versetzt · Getrennt = eigenes Panel je Datei. Die erste Datei liegt vorne/unten. "
-            "\"Live\" wendet den aktuell angezeigten Knoten des Gate-Baums auf JEDE Datei an.",
+            text="Overlay = übereinander · Offset = vertikal versetzt · Staggered = vertikal + horizontal versetzt · "
+            "Ridgeline = überlappende Kämme, erste Datei oben (Überlappung über \"Offset Y\": <100 % = überlappend) · "
+            "Getrennt = eigenes Panel je Datei. \"Live\" wendet den aktuell angezeigten Knoten des Gate-Baums auf "
+            "JEDE Datei an. Farben: Doppelklick auf eine Datei (Schema \"Dateifarben\"), eine Einheitsfarbe oder "
+            "ein Farbverlauf von der ersten zur letzten Kurve.",
             foreground="#555", wraplength=1000,
-        ).grid(row=5, column=0, columnspan=10, sticky="w", pady=(4, 0))
+        ).grid(row=6, column=0, columnspan=10, sticky="w", pady=(4, 0))
 
         body = ttk.PanedWindow(parent, orient="horizontal")
         body.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1022,14 +1143,33 @@ class GatingApp(ttk.Frame):
         if not hex_color:
             return
         self.ov_colors[path] = hex_color
+        self.ov_scheme_var.set(SCHEME_FILE)  # a per-file pick only shows under the per-file scheme
         selected = set(self._overlay_selected_paths()) | {path}
         self._refresh_overlay_file_list(select_paths=selected)
         self._schedule_overlay_redraw()
 
     def _overlay_reset_colors(self):
         self.ov_colors.clear()
+        self.ov_scheme_var.set(SCHEME_FILE)
         self._refresh_overlay_file_list()
         self._schedule_overlay_redraw()
+
+    def _on_overlay_scheme_changed(self):
+        # Back to per-file colors: restore the list tint (a gradient/single
+        # color scheme re-tints the selected rows on every redraw instead).
+        self._refresh_overlay_file_list()
+        self._schedule_overlay_redraw()
+
+    def _overlay_pick_single_color(self):
+        from tkinter import colorchooser
+
+        _, hex_color = colorchooser.askcolor(color=self.ov_single_color, title="Einheitsfarbe für alle Kurven", parent=self)
+        if not hex_color:
+            return
+        self.ov_single_color = hex_color
+        self.ov_single_color_btn.configure(bg=hex_color, activebackground=hex_color)
+        self.ov_scheme_var.set(SCHEME_SINGLE)
+        self._on_overlay_scheme_changed()
 
     def _schedule_overlay_redraw(self, *_):
         """Debounced: typing into an entry field fires once per keystroke,
@@ -1061,7 +1201,7 @@ class GatingApp(ttk.Frame):
         paths = self._overlay_selected_paths()
         if self.ov_reverse_var.get():
             paths = paths[::-1]
-        series, skipped = [], []
+        series, skipped, series_paths = [], [], []
         for path in paths:
             fcs = self._get_data(path)
             df = fcs.df
@@ -1083,6 +1223,17 @@ class GatingApp(ttk.Frame):
                 label=os.path.splitext(fcs.filename)[0], values=values,
                 color=self._overlay_color(path), n_gated=int(mask.sum()),
             ))
+            series_paths.append(path)
+
+        # Scheme colors are assigned by position among the PLOTTED curves, so a
+        # gradient always spans first -> last curve; the file list rows are
+        # tinted to match so it stays a legend.
+        colors = scheme_colors(len(series), self.ov_scheme_var.get(), self.ov_single_color)
+        if colors is not None:
+            for s, c, p in zip(series, colors, series_paths):
+                s.color = c
+                i = self.fcs_paths.index(p)
+                self.ov_file_listbox.itemconfig(i, foreground=c, selectbackground=c, selectforeground="white")
         return series, x_label, skipped
 
     def _overlay_display_transform(self, series: list[OverlaySeries]) -> DisplayTransform:
@@ -1151,7 +1302,7 @@ class GatingApp(ttk.Frame):
                 offset_frac=num(self.ov_offset_var, 60, 0) / 100.0,
                 stagger_frac=num(self.ov_stagger_var, 5, 0) / 100.0,
                 fill=self.ov_fill_var.get(), alpha=num(self.ov_alpha_var, 0.35, 0.0, 1.0),
-                legend_stats=self.ov_stats_var.get(), x_limits=x_limits,
+                legend_stats=self.ov_stats_var.get(), x_limits=x_limits, edge=self.ov_edge_var.get(),
             )
             try:
                 self.ov_figure.tight_layout()
@@ -2664,23 +2815,7 @@ class GatingApp(ttk.Frame):
             ylabel = f"Ratio {ch_a} / {ch_b}"
 
         binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
-
-        self.kin_ax.clear()
-        if len(binned):
-            self.kin_ax.errorbar(
-                binned["time_bin_start_s"], binned["median_ratio"], yerr=binned["sem_ratio"],
-                fmt="-o", markersize=3, linewidth=1, capsize=2,
-            )
-            baseline_end_s = parse_baseline_duration_s(fcs.filename)
-            if baseline_end_s is not None:
-                self.kin_ax.axvline(
-                    baseline_end_s, color="red", linestyle="--", linewidth=1,
-                    label=f"Stimulus ({baseline_end_s:.0f}s)"
-                )
-                self.kin_ax.legend()
-        self.kin_ax.set_xlabel("Zeit (s)")
-        self.kin_ax.set_ylabel(f"{ylabel} (Median pro Bin)")
-        self.kin_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events")
+        t_ev, v_ev = event_values(gated_df["Time"], value)
 
         # Manual axis limits to zoom into a time/value range; a bound left
         # blank keeps that side auto-scaled from the data as before.
@@ -2688,6 +2823,17 @@ class GatingApp(ttk.Frame):
         x_hi = self._parse_optional_float(self.kin_x_max_var.get())
         y_lo = self._parse_optional_float(self.kin_y_min_var.get())
         y_hi = self._parse_optional_float(self.kin_y_max_var.get())
+
+        opts = self._kin_draw_options()
+        self.kin_ax.clear()
+        n_drawn = draw_kinetics(
+            self.kin_ax, binned, t_ev, v_ev, y_limits=(y_lo, y_hi),
+            baseline_end_s=parse_baseline_duration_s(fcs.filename), **opts,
+        )
+        self.kin_ax.set_xlabel("Zeit (s)")
+        self.kin_ax.set_ylabel(kinetics_y_label(ylabel, opts["display"]))
+        self.kin_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events")
+
         if x_lo is not None or x_hi is not None:
             self.kin_ax.set_xlim(left=x_lo, right=x_hi)
         if y_lo is not None or y_hi is not None:
@@ -2695,12 +2841,15 @@ class GatingApp(ttk.Frame):
 
         self.kin_canvas.draw_idle()
 
-        n_bins = len(binned)
-        self.kin_status_var.set(
-            f"Population: {pop_desc} — {n_bins} Zeit-Bins, "
-            f"{int(value.notna().sum()) if mode == 'ratio' else len(value)} Events mit gültigem Wert."
-        )
+        msg = f"Population: {pop_desc} — {len(binned)} Zeit-Bins, {len(t_ev)} Events mit gültigem Wert."
+        if opts["display"] in KIN_EVENT_DISPLAYS and n_drawn < len(t_ev):
+            if opts["display"] == KIN_EVENT_DISPLAYS[0]:
+                msg += f"  Angezeigt: zufällige Stichprobe von {n_drawn} Events (Max. Punkte)."
+            else:
+                msg += f"  {len(t_ev) - n_drawn} Events außerhalb des Y-Bereichs der Heatmap."
+        self.kin_status_var.set(msg)
 
+        self._kin_last_events = (t_ev, v_ev)
         self._kin_last_binned = binned
         self._kin_last_label = ylabel
         self._kin_last_filename = fcs.filename
@@ -2726,6 +2875,25 @@ class GatingApp(ttk.Frame):
         messagebox.showinfo(
             "Exportiert", f"Kinetik gespeichert unter:\n{path}\n\n(Population: {self._kin_last_population})"
         )
+
+    def _export_kinetics_events_csv(self):
+        events = self._kin_last_events
+        if events is None or not len(events[0]):
+            messagebox.showwarning("Keine Daten", "Bitte zuerst die Kinetik berechnen (Tab anzeigen/aktualisieren).")
+            return
+        stem = os.path.splitext(self._kin_last_filename)[0]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"{stem}_kinetics_events.csv",
+            initialdir=self._ensure_exports_dir(),
+        )
+        if not path:
+            return
+        t_ev, v_ev = events
+        pd.DataFrame({
+            "filename": self._kin_last_filename, "population": self._kin_last_population,
+            "channel": self._kin_last_label, "time_s": t_ev, "value": v_ev,
+        }).to_csv(path, index=False)
+        messagebox.showinfo("Exportiert", f"{len(t_ev)} Einzel-Events gespeichert unter:\n{path}")
 
     def _require_named_population(self, gate_source_var: tk.StringVar) -> str | None:
         """Guard for the 'all files' batch exports / cohort computation: the
@@ -2825,6 +2993,13 @@ class GatingApp(ttk.Frame):
         if not out_dir:
             return
 
+        # Same display settings and axis limits as the on-screen plot.
+        opts = self._kin_draw_options()
+        x_lo = self._parse_optional_float(self.kin_x_min_var.get())
+        x_hi = self._parse_optional_float(self.kin_x_max_var.get())
+        y_lo = self._parse_optional_float(self.kin_y_min_var.get())
+        y_hi = self._parse_optional_float(self.kin_y_max_var.get())
+
         count = 0
         for path in self.fcs_paths:
             fcs = self._get_data(path)
@@ -2834,19 +3009,34 @@ class GatingApp(ttk.Frame):
             if mode == "single":
                 if ch_a not in gated_df.columns:
                     continue
-                value = gated_df[ch_a]
+                value, label = gated_df[ch_a], ch_a
             else:
                 if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
                     continue
                 value = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
+                label = f"Ratio {ch_a} / {ch_b}"
             binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
             if len(binned) == 0:
                 continue
-            baseline_end_s = parse_baseline_duration_s(fcs.filename)
+            t_ev, v_ev = event_values(gated_df["Time"], value)
+            fig = Figure(figsize=(8, 5))
+            ax = fig.add_subplot(111)
+            draw_kinetics(
+                ax, binned, t_ev, v_ev, y_limits=(y_lo, y_hi),
+                baseline_end_s=parse_baseline_duration_s(fcs.filename), **opts,
+            )
+            ax.set_xlabel("Zeit (s)")
+            ax.set_ylabel(kinetics_y_label(label, opts["display"]))
+            ax.set_title(f"{fcs.filename}\nPopulation: {source} — {mask.sum()}/{len(df)} Events", fontsize=10)
+            if x_lo is not None or x_hi is not None:
+                ax.set_xlim(left=x_lo, right=x_hi)
+            if y_lo is not None or y_hi is not None:
+                ax.set_ylim(bottom=y_lo, top=y_hi)
+            fig.tight_layout()
             stem = os.path.splitext(fcs.filename)[0]
             safe_source = "".join(c if c.isalnum() or c in "-_" else "_" for c in source)
             out_path = os.path.join(out_dir, f"{stem}_{safe_source}_kinetics.png")
-            plot_kinetics(binned, fcs.filename, baseline_end_s, out_path)
+            fig.savefig(out_path, dpi=150)
             count += 1
 
         messagebox.showinfo("Exportiert", f"{count} Kinetik-PNG(s) (Population: {source}) gespeichert in:\n{out_dir}")
