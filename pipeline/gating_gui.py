@@ -58,7 +58,6 @@ from clipboard_utils import copy_figure_to_clipboard
 from histogram_overlay import (
     COLOR_SCHEMES as OVERLAY_COLOR_SCHEMES,
     EDGE_COLORS as OVERLAY_EDGE_COLORS,
-    MODE_RIDGELINE,
     MODES as OVERLAY_MODES,
     NORMALIZATIONS as OVERLAY_NORMALIZATIONS,
     NORM_COUNT,
@@ -74,14 +73,18 @@ from histogram_overlay import (
 from io_utils import FcsData, find_fcs_files, load_fcs
 from kinetics import (
     KIN_DISPLAY_MEDIAN,
+    KIN_DISPLAY_RIDGE,
     KIN_DISPLAYS,
     KIN_EVENT_DISPLAYS,
+    RIDGE_SCHEME_STIM,
     bin_kinetics,
     compute_ratio,
     draw_kinetics,
+    draw_kinetics_ridgeline,
     event_values,
     kinetics_y_label,
     parse_baseline_duration_s,
+    ridge_color_schemes,
     value_stats,
 )
 from transforms import TRANSFORM_NAMES, apply_axis_scale
@@ -704,6 +707,68 @@ class GatingApp(ttk.Frame):
             foreground="#555", wraplength=1000,
         ).grid(row=10, column=0, columnspan=9, sticky="w")
 
+        # --- Ridgeline settings (only active for the Ridgeline display)
+        ridge_row = ttk.Frame(controls)
+        ridge_row.grid(row=11, column=0, columnspan=9, sticky="w", pady=(6, 0))
+        ridge_row2 = ttk.Frame(controls)
+        ridge_row2.grid(row=12, column=0, columnspan=9, sticky="w", pady=(4, 0))
+        redraw = lambda *a: self._redraw_kinetics()  # noqa: E731
+        self.kin_ridge_widgets = []
+
+        def add(w, padx=(0, 6)):
+            w.pack(side="left", padx=padx)
+            self.kin_ridge_widgets.append(w)
+            return w
+
+        ttk.Label(ridge_row, text="Ridgeline:", font=("", 9, "bold")).pack(side="left", padx=(0, 8))
+        self.kin_ridge_window_var = tk.StringVar(value="10")
+        self.kin_ridge_offset_var = tk.StringVar(value="60")
+        self.kin_ridge_smooth_var = tk.StringVar(value="1.5")
+        self.kin_ridge_alpha_var = tk.StringVar(value="0.8")
+        for text, var in (("Zeitfenster (s):", self.kin_ridge_window_var), ("Abstand (%):", self.kin_ridge_offset_var),
+                          ("Glättung:", self.kin_ridge_smooth_var), ("Deckkraft:", self.kin_ridge_alpha_var)):
+            add(ttk.Label(ridge_row, text=text))
+            add(ttk.Entry(ridge_row, textvariable=var, width=6), padx=(0, 10))
+            var.trace_add("write", redraw)
+        add(ttk.Label(ridge_row, text="Werte-Achse:"))
+        self.kin_ridge_transform_var = tk.StringVar(value="Linear")
+        add(ttk.Combobox(ridge_row, textvariable=self.kin_ridge_transform_var, state="readonly",
+                         values=TRANSFORM_NAMES, width=9), padx=(0, 10)).bind("<<ComboboxSelected>>", redraw)
+        add(ttk.Label(ridge_row, text="Normierung:"))
+        self.kin_ridge_norm_var = tk.StringVar(value=OVERLAY_NORMALIZATIONS[0])
+        add(ttk.Combobox(ridge_row, textvariable=self.kin_ridge_norm_var, state="readonly",
+                         values=OVERLAY_NORMALIZATIONS, width=20)).bind("<<ComboboxSelected>>", redraw)
+
+        add(ttk.Label(ridge_row2, text="Farbschema:"), padx=(0, 4))
+        self.kin_ridge_scheme_var = tk.StringVar(value=RIDGE_SCHEME_STIM)
+        add(ttk.Combobox(ridge_row2, textvariable=self.kin_ridge_scheme_var, state="readonly",
+                         values=ridge_color_schemes(), width=20), padx=(0, 8)).bind("<<ComboboxSelected>>", redraw)
+        self.kin_ridge_colors = {"pre": "#8c8c8c", "post": "#d62728", "single": "#1f77b4"}
+        self.kin_ridge_color_btns = {}
+        for key, text in (("pre", "Farbe vor Stimulus…"), ("post", "Farbe nach Stimulus…"), ("single", "Einheitsfarbe…")):
+            c = self.kin_ridge_colors[key]
+            btn = tk.Button(ridge_row2, text=text, bg=c, fg="white", activebackground=c, relief="groove",
+                            command=lambda k=key: self._kin_pick_ridge_color(k))
+            add(btn, padx=(0, 4))
+            self.kin_ridge_color_btns[key] = btn
+        add(ttk.Label(ridge_row2, text="Kontur:"), padx=(8, 4))
+        self.kin_ridge_edge_var = tk.StringVar(value=OVERLAY_EDGE_COLORS[0])
+        add(ttk.Combobox(ridge_row2, textvariable=self.kin_ridge_edge_var, state="readonly",
+                         values=OVERLAY_EDGE_COLORS, width=18), padx=(0, 10)).bind("<<ComboboxSelected>>", redraw)
+        self.kin_ridge_fill_var = tk.BooleanVar(value=True)
+        self.kin_ridge_early_top_var = tk.BooleanVar(value=True)
+        self.kin_ridge_median_var = tk.BooleanVar(value=True)
+        for text, var in (("Gefüllt", self.kin_ridge_fill_var), ("Früh oben", self.kin_ridge_early_top_var),
+                          ("Median-Punkte", self.kin_ridge_median_var)):
+            add(ttk.Checkbutton(ridge_row2, text=text, variable=var, command=redraw))
+        ttk.Label(
+            controls,
+            text="(Ridgeline: ein Kamm pro Zeitfenster, X = Wert. Eine Fenstergrenze liegt genau auf der "
+            "Stimulus-Zeit aus dem Dateinamen. \"Werte-Achse Min/Max\" oben begrenzt hier die X-Achse, "
+            "\"Zeit-Achse Min/Max\" den Zeitbereich der Kämme.)",
+            foreground="#555", wraplength=1000,
+        ).grid(row=13, column=0, columnspan=9, sticky="w")
+
         self.kin_figure = Figure(figsize=(8, 6))
         self.kin_ax = self.kin_figure.add_subplot(111)
         self.kin_canvas = FigureCanvasTkAgg(self.kin_figure, master=parent)
@@ -719,14 +784,98 @@ class GatingApp(ttk.Frame):
         self._on_kin_display_changed(redraw=False)
 
     def _on_kin_display_changed(self, redraw: bool = True):
-        is_events = self.kin_display_var.get() in KIN_EVENT_DISPLAYS
-        for w in self.kin_event_widgets:
-            try:
-                w.configure(state="normal" if is_events else "disabled")
-            except tk.TclError:
-                pass
+        display = self.kin_display_var.get()
+        for widgets, active in ((self.kin_event_widgets, display in KIN_EVENT_DISPLAYS),
+                                (self.kin_ridge_widgets, display == KIN_DISPLAY_RIDGE)):
+            for w in widgets:
+                try:
+                    if isinstance(w, ttk.Combobox):
+                        w.configure(state="readonly" if active else "disabled")
+                    else:
+                        w.configure(state="normal" if active else "disabled")
+                except tk.TclError:
+                    pass
         if redraw:
             self._redraw_kinetics()
+
+    def _kin_pick_ridge_color(self, key: str):
+        from tkinter import colorchooser
+
+        titles = {"pre": "Farbe der Kämme VOR dem Stimulus", "post": "Farbe der Kämme NACH dem Stimulus",
+                  "single": "Einheitsfarbe aller Kämme"}
+        _, hex_color = colorchooser.askcolor(color=self.kin_ridge_colors[key], title=titles[key], parent=self)
+        if not hex_color:
+            return
+        self.kin_ridge_colors[key] = hex_color
+        self.kin_ridge_color_btns[key].configure(bg=hex_color, activebackground=hex_color)
+        if key == "single":
+            self.kin_ridge_scheme_var.set(SCHEME_SINGLE)
+        elif self.kin_ridge_scheme_var.get() != RIDGE_SCHEME_STIM:
+            self.kin_ridge_scheme_var.set(RIDGE_SCHEME_STIM)
+        self._redraw_kinetics()
+
+    def _kin_ridge_options(self) -> dict:
+        def num(var, default, lo, hi):
+            v = self._parse_optional_float(var.get())
+            return min(hi, max(lo, default if v is None else v))
+
+        return {
+            "window_s": num(self.kin_ridge_window_var, 10.0, 0.01, 1e6),
+            "offset_frac": num(self.kin_ridge_offset_var, 60.0, 5.0, 1000.0) / 100.0,
+            "smooth_sigma": num(self.kin_ridge_smooth_var, 1.5, 0.0, 50.0),
+            "alpha": num(self.kin_ridge_alpha_var, 0.8, 0.0, 1.0),
+            "normalization": self.kin_ridge_norm_var.get(),
+            "fill": self.kin_ridge_fill_var.get(),
+            "edge": self.kin_ridge_edge_var.get(),
+            "scheme": self.kin_ridge_scheme_var.get(),
+            "single_color": self.kin_ridge_colors["single"],
+            "pre_color": self.kin_ridge_colors["pre"],
+            "post_color": self.kin_ridge_colors["post"],
+            "early_on_top": self.kin_ridge_early_top_var.get(),
+            "show_median": self.kin_ridge_median_var.get(),
+        }
+
+    def _kin_axis_limits(self) -> tuple[float | None, float | None, float | None, float | None]:
+        return tuple(self._parse_optional_float(v.get()) for v in (
+            self.kin_x_min_var, self.kin_x_max_var, self.kin_y_min_var, self.kin_y_max_var))
+
+    def _render_kinetics(self, ax, filename: str, binned, t_ev, v_ev, value_label: str, channel: str | None,
+                         title: str) -> str:
+        """Draw one kinetic (any display) onto a cleared ax, with the tab's
+        settings and axis limits. Shared by the on-screen plot and the batch
+        PNG export so both always look identical. Returns a status note."""
+        opts = self._kin_draw_options()
+        x_lo, x_hi, y_lo, y_hi = self._kin_axis_limits()
+        baseline_end_s = parse_baseline_duration_s(filename)
+        note = ""
+        if opts["display"] == KIN_DISPLAY_RIDGE:
+            tr = self._make_display_transform(self.kin_ridge_transform_var.get(), channel, [v_ev])
+            info = draw_kinetics_ridgeline(
+                ax, t_ev, v_ev, tr, value_limits=(y_lo, y_hi), time_limits=(x_lo, x_hi),
+                baseline_end_s=baseline_end_s, **self._kin_ridge_options(),
+            )
+            ax.set_xlabel(value_label)
+            note = f"  Ridgeline: {info['n_windows']} Zeitfenster."
+            if info["n_out_of_range"]:
+                note += f" {info['n_out_of_range']} Events außerhalb des Werte-Bereichs."
+            if not info["stimulus_found"] and self.kin_ridge_scheme_var.get() == RIDGE_SCHEME_STIM:
+                note += " Keine Stimulus-Zeit im Dateinamen gefunden → alle Kämme in \"nach\"-Farbe."
+        else:
+            n_drawn = draw_kinetics(ax, binned, t_ev, v_ev, y_limits=(y_lo, y_hi),
+                                    baseline_end_s=baseline_end_s, **opts)
+            ax.set_xlabel("Zeit (s)")
+            ax.set_ylabel(kinetics_y_label(value_label, opts["display"]))
+            if x_lo is not None or x_hi is not None:
+                ax.set_xlim(left=x_lo, right=x_hi)
+            if y_lo is not None or y_hi is not None:
+                ax.set_ylim(bottom=y_lo, top=y_hi)
+            if opts["display"] in KIN_EVENT_DISPLAYS and n_drawn < len(t_ev):
+                if opts["display"] == KIN_EVENT_DISPLAYS[0]:
+                    note = f"  Angezeigt: zufällige Stichprobe von {n_drawn} Events (Max. Punkte)."
+                else:
+                    note = f"  {len(t_ev) - n_drawn} Events außerhalb des Y-Bereichs der Heatmap."
+        ax.set_title(title, fontsize=10)
+        return note
 
     def _kin_pick_point_color(self):
         from tkinter import colorchooser
@@ -1008,22 +1157,13 @@ class GatingApp(ttk.Frame):
             bg=self.ov_single_color, fg="white", activebackground=self.ov_single_color, relief="groove",
         )
         self.ov_single_color_btn.pack(side="left", padx=(0, 16))
-        ttk.Label(color_row, text="Kontur:").pack(side="left")
-        self.ov_edge_var = tk.StringVar(value=OVERLAY_EDGE_COLORS[0])
-        edge_combo = ttk.Combobox(
-            color_row, textvariable=self.ov_edge_var, state="readonly", values=OVERLAY_EDGE_COLORS, width=20
-        )
-        edge_combo.pack(side="left", padx=(4, 8))
-        edge_combo.bind("<<ComboboxSelected>>", redraw)
-        ttk.Label(color_row, text="(Kontur gilt für Ridgeline)", foreground="#555").pack(side="left")
 
         ttk.Label(
             controls,
             text="Overlay = übereinander · Offset = vertikal versetzt · Staggered = vertikal + horizontal versetzt · "
-            "Ridgeline = überlappende Kämme, erste Datei oben (Überlappung über \"Offset Y\": <100 % = überlappend) · "
-            "Getrennt = eigenes Panel je Datei. \"Live\" wendet den aktuell angezeigten Knoten des Gate-Baums auf "
-            "JEDE Datei an. Farben: Doppelklick auf eine Datei (Schema \"Dateifarben\"), eine Einheitsfarbe oder "
-            "ein Farbverlauf von der ersten zur letzten Kurve.",
+            "Getrennt = eigenes Panel je Datei. Die erste Datei liegt vorne/unten. \"Live\" wendet den aktuell "
+            "angezeigten Knoten des Gate-Baums auf JEDE Datei an. Farben: Doppelklick auf eine Datei (Schema "
+            "\"Dateifarben\"), eine Einheitsfarbe oder ein Farbverlauf von der ersten zur letzten Kurve.",
             foreground="#555", wraplength=1000,
         ).grid(row=6, column=0, columnspan=10, sticky="w", pady=(4, 0))
 
@@ -1237,6 +1377,13 @@ class GatingApp(ttk.Frame):
         return series, x_label, skipped
 
     def _overlay_display_transform(self, series: list[OverlaySeries]) -> DisplayTransform:
+        channel = self.ov_channel_a_var.get() if self.ov_mode_var.get() == "single" else None
+        return self._make_display_transform(self.ov_transform_var.get(), channel, [s.values for s in series])
+
+    def _make_display_transform(self, transform_name: str, channel: str | None, value_arrays) -> DisplayTransform:
+        """Axis transform with the Gating tab's Log/Logicle parameters.
+        ``channel`` = raw channel (its instrument range sets the Logicle
+        top-of-scale) or None for a ratio (data maximum is used instead)."""
         try:
             linthresh = float(self.log_linthresh_var.get())
         except ValueError:
@@ -1252,12 +1399,12 @@ class GatingApp(ttk.Frame):
         # Logicle top-of-scale: the channel's declared range when plotting a
         # raw channel; for a ratio (no instrument range) the data maximum.
         channel_range = None
-        if self.ov_mode_var.get() == "single" and self.current_path:
-            channel_range = (self._get_data(self.current_path).channel_ranges or {}).get(self.ov_channel_a_var.get())
+        if channel and self.current_path:
+            channel_range = (self._get_data(self.current_path).channel_ranges or {}).get(channel)
         if not channel_range:
-            channel_range = max((float(np.max(np.abs(s.values))) for s in series), default=262144.0)
+            channel_range = max((float(np.max(np.abs(a))) for a in value_arrays if len(a)), default=262144.0)
         return DisplayTransform(
-            self.ov_transform_var.get(), channel_range=channel_range,
+            transform_name, channel_range=channel_range,
             log_linthresh=linthresh, logicle_w=logicle_w, logicle_m=logicle_m,
         )
 
@@ -1302,7 +1449,7 @@ class GatingApp(ttk.Frame):
                 offset_frac=num(self.ov_offset_var, 60, 0) / 100.0,
                 stagger_frac=num(self.ov_stagger_var, 5, 0) / 100.0,
                 fill=self.ov_fill_var.get(), alpha=num(self.ov_alpha_var, 0.35, 0.0, 1.0),
-                legend_stats=self.ov_stats_var.get(), x_limits=x_limits, edge=self.ov_edge_var.get(),
+                legend_stats=self.ov_stats_var.get(), x_limits=x_limits,
             )
             try:
                 self.ov_figure.tight_layout()
@@ -2808,6 +2955,7 @@ class GatingApp(ttk.Frame):
             value = gated_df[channel]
             ylabel = channel
         else:
+            channel = None
             ch_a, ch_b = self.kin_channel_a_var.get(), self.kin_channel_b_var.get()
             if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
                 return
@@ -2817,37 +2965,25 @@ class GatingApp(ttk.Frame):
         binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
         t_ev, v_ev = event_values(gated_df["Time"], value)
 
-        # Manual axis limits to zoom into a time/value range; a bound left
-        # blank keeps that side auto-scaled from the data as before.
-        x_lo = self._parse_optional_float(self.kin_x_min_var.get())
-        x_hi = self._parse_optional_float(self.kin_x_max_var.get())
-        y_lo = self._parse_optional_float(self.kin_y_min_var.get())
-        y_hi = self._parse_optional_float(self.kin_y_max_var.get())
-
-        opts = self._kin_draw_options()
-        self.kin_ax.clear()
-        n_drawn = draw_kinetics(
-            self.kin_ax, binned, t_ev, v_ev, y_limits=(y_lo, y_hi),
-            baseline_end_s=parse_baseline_duration_s(fcs.filename), **opts,
-        )
-        self.kin_ax.set_xlabel("Zeit (s)")
-        self.kin_ax.set_ylabel(kinetics_y_label(ylabel, opts["display"]))
-        self.kin_ax.set_title(f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events")
-
-        if x_lo is not None or x_hi is not None:
-            self.kin_ax.set_xlim(left=x_lo, right=x_hi)
-        if y_lo is not None or y_hi is not None:
-            self.kin_ax.set_ylim(bottom=y_lo, top=y_hi)
-
+        # The whole figure is rebuilt (not just ax.clear()): the Ridgeline
+        # display hides spines / sets a non-linear X scale, which would
+        # otherwise leak into the next display.
+        self.kin_figure.clear()
+        self.kin_ax = self.kin_figure.add_subplot(111)
+        try:
+            note = self._render_kinetics(
+                self.kin_ax, fcs.filename, binned, t_ev, v_ev, ylabel, channel,
+                f"{fcs.filename}\nPopulation: {pop_desc} — {mask.sum()}/{len(df)} Events",
+            )
+            self.kin_figure.tight_layout()
+        except Exception as exc:
+            self.kin_status_var.set(f"Fehler beim Zeichnen: {exc}")
+            return
         self.kin_canvas.draw_idle()
 
-        msg = f"Population: {pop_desc} — {len(binned)} Zeit-Bins, {len(t_ev)} Events mit gültigem Wert."
-        if opts["display"] in KIN_EVENT_DISPLAYS and n_drawn < len(t_ev):
-            if opts["display"] == KIN_EVENT_DISPLAYS[0]:
-                msg += f"  Angezeigt: zufällige Stichprobe von {n_drawn} Events (Max. Punkte)."
-            else:
-                msg += f"  {len(t_ev) - n_drawn} Events außerhalb des Y-Bereichs der Heatmap."
-        self.kin_status_var.set(msg)
+        self.kin_status_var.set(
+            f"Population: {pop_desc} — {len(binned)} Zeit-Bins, {len(t_ev)} Events mit gültigem Wert.{note}"
+        )
 
         self._kin_last_events = (t_ev, v_ev)
         self._kin_last_binned = binned
@@ -2993,13 +3129,6 @@ class GatingApp(ttk.Frame):
         if not out_dir:
             return
 
-        # Same display settings and axis limits as the on-screen plot.
-        opts = self._kin_draw_options()
-        x_lo = self._parse_optional_float(self.kin_x_min_var.get())
-        x_hi = self._parse_optional_float(self.kin_x_max_var.get())
-        y_lo = self._parse_optional_float(self.kin_y_min_var.get())
-        y_hi = self._parse_optional_float(self.kin_y_max_var.get())
-
         count = 0
         for path in self.fcs_paths:
             fcs = self._get_data(path)
@@ -3009,29 +3138,25 @@ class GatingApp(ttk.Frame):
             if mode == "single":
                 if ch_a not in gated_df.columns:
                     continue
-                value, label = gated_df[ch_a], ch_a
+                value, label, channel = gated_df[ch_a], ch_a, ch_a
             else:
                 if ch_a not in gated_df.columns or ch_b not in gated_df.columns:
                     continue
                 value = compute_ratio(gated_df, ch_a, ch_b, min_signal=min_signal)
-                label = f"Ratio {ch_a} / {ch_b}"
+                label, channel = f"Ratio {ch_a} / {ch_b}", None
             binned = bin_kinetics(gated_df["Time"], value, bin_width_s=bin_width)
             if len(binned) == 0:
                 continue
             t_ev, v_ev = event_values(gated_df["Time"], value)
-            fig = Figure(figsize=(8, 5))
+            # Same display settings and axis limits as the on-screen plot;
+            # Ridgelines get more height so the ridges stay readable.
+            is_ridge = self.kin_display_var.get() == KIN_DISPLAY_RIDGE
+            fig = Figure(figsize=(8, 8) if is_ridge else (8, 5))
             ax = fig.add_subplot(111)
-            draw_kinetics(
-                ax, binned, t_ev, v_ev, y_limits=(y_lo, y_hi),
-                baseline_end_s=parse_baseline_duration_s(fcs.filename), **opts,
+            self._render_kinetics(
+                ax, fcs.filename, binned, t_ev, v_ev, label, channel,
+                f"{fcs.filename}\nPopulation: {source} — {mask.sum()}/{len(df)} Events",
             )
-            ax.set_xlabel("Zeit (s)")
-            ax.set_ylabel(kinetics_y_label(label, opts["display"]))
-            ax.set_title(f"{fcs.filename}\nPopulation: {source} — {mask.sum()}/{len(df)} Events", fontsize=10)
-            if x_lo is not None or x_hi is not None:
-                ax.set_xlim(left=x_lo, right=x_hi)
-            if y_lo is not None or y_hi is not None:
-                ax.set_ylim(bottom=y_lo, top=y_hi)
             fig.tight_layout()
             stem = os.path.splitext(fcs.filename)[0]
             safe_source = "".join(c if c.isalnum() or c in "-_" else "_" for c in source)
