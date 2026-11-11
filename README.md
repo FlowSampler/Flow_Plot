@@ -17,8 +17,23 @@ Oberfläche (Tkinter + Matplotlib) und einer Batch-Pipeline für die Kommandozei
 
 ## Installation
 
-Voraussetzung: **Python 3.10 oder neuer** (getestet mit 3.13). Tkinter ist in den
+Voraussetzung: **Python 3.10 oder neuer** (getestet mit 3.13 und 3.14). Tkinter ist in den
 Python-Installern von python.org und in Anaconda bereits enthalten.
+
+### Einfachster Weg (Windows): `start.bat`
+
+1. Python von [python.org](https://www.python.org/downloads/) installieren und dabei
+   **„Add python.exe to PATH“** anhaken
+2. Repo herunterladen (grüner Knopf **„Code“ → „Download ZIP“**) und entpacken
+3. **`start.bat` doppelklicken**
+
+Beim ersten Start legt das Skript im Projektordner eine eigene Python-Umgebung (`.venv`) an
+und installiert alle Pakete (dauert einige Minuten). Danach startet die GUI immer direkt mit
+dieser Umgebung, und die übrige Python-Installation bleibt unberührt. Hat sich
+`requirements.txt` geändert (z.B. nach einem Update), werden fehlende Pakete automatisch
+nachinstalliert. Bei Problemen den Ordner `.venv` löschen und `start.bat` erneut starten.
+
+### Manuell (alle Betriebssysteme)
 
 ```powershell
 git clone https://github.com/FlowSampler/Flow_Plot.git
@@ -57,6 +72,7 @@ Flow_Plot/
 ├── gates/                    # gespeicherte Gate-Sets (JSON)
 ├── Ca2+_kinetic/             # eigene .fcs-Dateien hier ablegen (nicht im Repo)
 ├── output/                   # Ergebnisse der Pipeline (nicht im Repo)
+├── start.bat                 # Windows: Umgebung einrichten + GUI starten
 └── requirements.txt
 ```
 
