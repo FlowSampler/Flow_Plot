@@ -39,6 +39,22 @@ dieser Umgebung, und die übrige Python-Installation bleibt unberührt. Hat sich
 `requirements.txt` geändert (z.B. nach einem Update), werden fehlende Pakete automatisch
 nachinstalliert. Bei Problemen den Ordner `.venv` löschen und `start.bat` erneut starten.
 
+### Updates
+
+Beim Start prüft `start.bat`, ob auf GitHub eine neuere
+[Release](https://github.com/FlowSampler/Flow_Plot/releases) vorliegt, und fragt nach
+(**Jetzt aktualisieren** / **Später** / **Diese Version überspringen**). Nach dem Update
+startet Flow_Plot automatisch neu und installiert ggf. neue Pakete. Eigene Gate-Sets in
+`gates/`, `output/`, `exports/` und Messdaten bleiben unverändert; der vorherige Stand der
+ersetzten Dateien liegt in `.update_backup/`. Ohne Internet wird die Prüfung übersprungen.
+Abschalten: Umgebungsvariable `FLOWPLOT_NO_UPDATE=1` setzen. In einem Git-Checkout wird
+nicht automatisch aktualisiert (dort `git pull`).
+
+**Neue Version veröffentlichen:** `__version__` in `pipeline/version.py` hochzählen,
+committen und pushen, dann auf GitHub unter *Releases → Draft a new release* ein Tag mit
+derselben Nummer anlegen (z.B. `v1.1.0`) und die Änderungen in die Beschreibung schreiben –
+die wird den Nutzern im Update-Dialog angezeigt.
+
 ### Manuell (alle Betriebssysteme)
 
 ```powershell
@@ -75,7 +91,9 @@ Flow_Plot/
 │   ├── histogram_overlay.py  # Histogramm-Overlays mehrerer Dateien
 │   ├── transforms.py         # Achsen-Transformationen (Linear / Log / Logicle)
 │   ├── io_utils.py           # FCS-Dateien finden und laden
-│   └── clipboard_utils.py    # Plot → Windows-Zwischenablage
+│   ├── clipboard_utils.py    # Plot → Windows-Zwischenablage
+│   ├── updater.py            # Update-Prüfung beim Start (GitHub-Releases)
+│   └── version.py            # aktuelle Versionsnummer
 ├── start.bat                 # Windows: Umgebung einrichten + GUI starten
 └── requirements.txt
 ```

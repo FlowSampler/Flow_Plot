@@ -114,6 +114,7 @@ from panel_export import (
     write_panel_xlsx,
 )
 from transforms import TRANSFORM_NAMES, apply_axis_scale
+from version import __version__
 
 SHAPES = ["Polygon", "Rectangle", "Ellipse", "Quadrant", "Quadrant (Winkel)"]
 QUADRANT_SHAPES = ("Quadrant", "Quadrant (Winkel)")
@@ -4660,7 +4661,7 @@ def main():
     args = parser.parse_args()
 
     root = tk.Tk()
-    root.title("Ca2+ Kinetik - Gate Editor")
+    root.title(f"Ca2+ Kinetik - Gate Editor  (Flow_Plot {__version__})")
     root.geometry("1280x800")
     GatingApp(root, input_dir=args.input_dir, gates_dir=args.gates_dir)
     root.mainloop()

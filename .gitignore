@@ -8,6 +8,11 @@ exports/
 # Bilder für die Doku dürfen rein
 !docs/**/*.png
 
+# Updater (lokaler Zustand)
+.update_manifest.json
+.update_skip
+.update_backup/
+
 # Python
 __pycache__/
 *.py[cod]

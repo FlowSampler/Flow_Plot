@@ -50,6 +50,12 @@ if errorlevel 1 goto failed
 copy /y "requirements.txt" "%STAMP%" >nul
 
 :run
+rem --- Update-Pruefung (abschalten: FLOWPLOT_NO_UPDATE=1 setzen) --------------
+rem  Exit-Code 3 = Update installiert -> dieses Skript neu starten. Alles muss in
+rem  EINER Zeile stehen: das Update kann start.bat selbst ersetzen, und cmd liest
+rem  Batch-Dateien zeilenweise waehrend der Ausfuehrung.
+if not defined FLOWPLOT_NO_UPDATE ( "%VENV_PY%" "pipeline\updater.py" & if errorlevel 3 ( set "FLOWPLOT_NO_UPDATE=1" & call "%~f0" %* & exit /b ) )
+
 echo Starte Flow_Plot ...
 "%VENV_PY%" "pipeline\gating_gui.py" %*
 if errorlevel 1 (
