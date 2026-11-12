@@ -13,6 +13,8 @@ Oberfläche (Tkinter + Matplotlib) und einer Batch-Pipeline für die Kommandozei
   Einzel-Events, Dichte, Ridgeline pro Zeitfenster)
 - **Statistik**: Count / %positiv / %negativ pro Datei oder für die ganze Kohorte
 - **Histogramm-Overlay** mehrerer Dateien (übereinander, versetzt, gestaffelt, getrennte Panels)
+- **Panel-Export**: beliebig viele Populationen × Marker × Statistiken (Anzahl, % Eltern-Gate,
+  MFI Median / Mean / geom. Mean, rCV) für alle Dateien in **einer** Excel-Tabelle mit Spalten-Heatmap
 - **Export** als CSV/PNG, Plots per Klick in die Zwischenablage (Strg+V in PowerPoint/Word)
 
 ## Installation
@@ -280,6 +282,26 @@ Dateien in einem Plot vergleichen.
 
 Einstellungen, die für die gewählte Darstellung keine Wirkung haben (z.B. "Offset Y" bei
 "Overlay"), werden in allen Tabs automatisch ausgeblendet.
+
+### Panel-Export-Tab (direkt in der GUI)
+
+Fünfter Tab **"Panel-Export"**: mehrere Messgrößen auf einmal für alle Dateien, als eine
+Tabelle im Wide-Format (eine Zeile pro Probe, eine Spalte pro Population | Marker | Statistik).
+
+- **Population** = gespeichertes Gate-Set. Die Statistik wird immer auf genau dieser Population
+  berechnet: `CD4+CD8-` → MFI aller CD4+CD8- Zellen; `CD4+CD107a+` → nur die CD107a+ Zellen.
+  Pro Datei gilt die passende Gate-Variante (Datei > Gruppe > alle), wie überall in der GUI.
+- **Bezug für %**: Standard ist das **Eltern-Gate** (Gate-Set ohne seinen letzten Schritt), d.h.
+  das gezeichnete Gate ist die Positiv-Grenze: `CD4+CD107a+` → % CD107a+ von CD4+. Alternativ
+  "Alle Events" oder ein beliebiges anderes Gate-Set.
+- **Marker**: mehrere auswählbar, pro Marker wird eine Zeile angelegt (keiner = nur Anzahl / %).
+- **Statistiken**: Anzahl, % Bezug, % aller Events, MFI Median, Mean, geometrischer Mean
+  (nur Werte > 0) und rCV % — pro Zeile individuell.
+- **Schwelle (optional)**: liefert zusätzlich "% > Schwelle" und die Statistiken nur der Zellen
+  darüber (Rohwert des Kanals).
+- Panels als Vorlage speichern/laden (`panels/`), um sie in anderen Experimenten wiederzuverwenden.
+- Export als **Excel** (Blatt "Daten" mit Heatmap pro Spalte, "Panel" = Definition,
+  "Gates" = verwendete Gate-Variante je Datei) oder als CSV.
 
 ### Option B: CLI (nicht-interaktiv, nur Polygon)
 

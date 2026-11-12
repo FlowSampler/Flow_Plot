@@ -15,6 +15,7 @@ class FcsData:
     filename: str
     df: pd.DataFrame  # raw channel values, one column per PnN channel
     channel_ranges: dict[str, float] = None  # $PnR instrument range per channel, if available
+    marker_names: dict[str, str] = None  # $PnS marker/stain name per channel (e.g. 'CD107a'), if set
 
 
 def load_fcs(path: str) -> FcsData:
@@ -34,10 +35,18 @@ def load_fcs(path: str) -> FcsData:
             except (TypeError, ValueError):
                 pass
 
-    return FcsData(path=path, filename=os.path.basename(path), df=df, channel_ranges=channel_ranges)
+    marker_names = {}
+    for pnn, pns in zip(sample.pnn_labels, getattr(sample, "pns_labels", []) or []):
+        if pns and str(pns).strip() and str(pns).strip() != pnn:
+            marker_names[pnn] = str(pns).strip()
+
+    return FcsData(
+        path=path, filename=os.path.basename(path), df=df,
+        channel_ranges=channel_ranges, marker_names=marker_names,
+    )
 
 
-_RESERVED_SUBDIRS = {"gates", "exports"}
+_RESERVED_SUBDIRS = {"gates", "exports", "panels", "strategies"}
 
 _NUM_RE = re.compile(r"(\d+)")
 

@@ -5,5 +5,7 @@ pandas>=2.2
 matplotlib>=3.9
 scipy>=1.13
 pillow>=10.0
+# Excel-Export (Panel-Export mit Spalten-Heatmap)
+openpyxl>=3.1
 # nur für "Plot in Zwischenablage kopieren" (Windows-Zwischenablage)
 pywin32>=306; sys_platform == "win32"
