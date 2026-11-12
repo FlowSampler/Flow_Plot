@@ -8,6 +8,8 @@ Oberfläche (Tkinter + Matplotlib) und einer Batch-Pipeline für die Kommandozei
 
 - **Gating** wie in FlowJo: hierarchischer Gate-Baum (Polygon / Rechteck / Ellipse), Gate-Sets
   speicherbar für alle Dateien, eine Gruppe oder eine einzelne Datei
+- **Kompensation**: Spillover-Matrix aus der FCS-Datei (Standard, wie FACSDiva/FlowJo) oder eine
+  eigene Experiment-Matrix; Anpassen per Greifen-und-Ziehen im Plot oder direkt in der NxN-Tabelle
 - **Darstellungen**: Scatter, 2D-Histogramm, Dichte, Konturen; Achsen Linear / Log / Logicle
 - **Kinetik**: Einzelkanal oder Ratio zweier Kanäle über die Zeit (Median/Mittelwert pro Bin,
   Einzel-Events, Dichte, Ridgeline pro Zeitfenster)
@@ -249,7 +251,7 @@ Gates sofort zu kontrollieren, ganz ohne die Batch-Pipeline zu starten:
 
 ### Statistik-Tab (direkt in der GUI)
 
-Dritter Tab **"Statistik"**: Count / %positive / %negative für einen Kanal oder ein Ratio,
+Tab **"Statistik"**: Count / %positive / %negative für einen Kanal oder ein Ratio,
 pro Einzeldatei oder für die gesamte Kohorte — exportierbar als CSV.
 
 - **Einzelkanal** oder **Ratio (Kanal A / Kanal B)** wie im Kinetik-Tab wählen
@@ -268,7 +270,7 @@ pro Einzeldatei oder für die gesamte Kohorte — exportierbar als CSV.
 
 ### Histogramm-Overlay-Tab (direkt in der GUI)
 
-Vierter Tab **"Histogramm-Overlay"**: die Verteilung eines Kanals oder Ratios für mehrere
+Tab **"Histogramm-Overlay"**: die Verteilung eines Kanals oder Ratios für mehrere
 Dateien in einem Plot vergleichen.
 
 - Dateien links auswählen (Strg/Shift-Klick für Mehrfachauswahl, "Name enthält" zum Filtern)
@@ -283,9 +285,30 @@ Dateien in einem Plot vergleichen.
 Einstellungen, die für die gewählte Darstellung keine Wirkung haben (z.B. "Offset Y" bei
 "Overlay"), werden in allen Tabs automatisch ausgeblendet.
 
+### Kompensation
+
+FACSDiva speichert die Messwerte in der `.fcs`-Datei **unkompensiert** und hängt nur die
+Spillover-Matrix an (`$SPILL`/`$SPILLOVER`; `APPLY COMPENSATION=TRUE` ist bloß ein Hinweis an die
+Auswertesoftware). Links unter **"Kompensation"** wird gewählt, womit ALLE Tabs und Exporte rechnen:
+
+- **Matrix aus der FCS-Datei** (Standard) — entspricht der Anzeige in Diva/FlowJo
+- **Experiment-Matrix (bearbeitet)** — gespeichert in `<Experiment>/compensation/matrix.json`
+- **Keine** — Rohdaten
+
+Tab **"Kompensation"**: X (Fluorochrom) und Y (Detektor) wählen, dann die Population im Plot
+**greifen und ziehen** — senkrecht ändert den Spillover X → Y, waagerecht Y → X. Die rote Linie
+(Median von Y entlang X) sollte bei korrekter Kompensation waagerecht auf Höhe der grauen Linie
+(Median der X-negativen Zellen) liegen; am besten an den Einzelfärbungen prüfen. Werte lassen sich
+auch direkt in der NxN-Tabelle (in %) eintippen; Klick auf eine Zelle zeigt das Paar.
+"Rückgängig", CSV-Import/-Export, Start aus Datei-Matrix oder Einheitsmatrix.
+**"Speichern & auf alle Dateien anwenden"** speichert die Experiment-Matrix und schaltet alle Tabs
+darauf um. Gates auf Fluoreszenzkanälen danach kurz kontrollieren.
+
+Die CLI-Pipeline (`run_pipeline.py`) rechnet weiterhin auf Rohdaten.
+
 ### Panel-Export-Tab (direkt in der GUI)
 
-Fünfter Tab **"Panel-Export"**: mehrere Messgrößen auf einmal für alle Dateien, als eine
+Tab **"Panel-Export"**: mehrere Messgrößen auf einmal für alle Dateien, als eine
 Tabelle im Wide-Format (eine Zeile pro Probe, eine Spalte pro Population | Marker | Statistik).
 
 - **Population** = gespeichertes Gate-Set. Die Statistik wird immer auf genau dieser Population

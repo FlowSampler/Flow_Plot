@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import flowkit as fk
 import pandas as pd
 
+from compensation import CompMatrix, parse_spill
+
 
 @dataclass
 class FcsData:
@@ -16,10 +18,14 @@ class FcsData:
     df: pd.DataFrame  # raw channel values, one column per PnN channel
     channel_ranges: dict[str, float] = None  # $PnR instrument range per channel, if available
     marker_names: dict[str, str] = None  # $PnS marker/stain name per channel (e.g. 'CD107a'), if set
+    spill: CompMatrix | None = None  # spillover matrix stored in the file ($SPILLOVER/SPILL), if any
+    compensation: str = "keine"  # which compensation df currently has applied (description for the UI)
 
 
 def load_fcs(path: str) -> FcsData:
-    """Load a single FCS file and return its raw (uncompensated, untransformed) event data."""
+    """Load a single FCS file and return its raw (uncompensated, untransformed)
+    event data. The file's own spillover matrix is parsed into .spill but NOT
+    applied — use compensation.compensate() for that."""
     sample = fk.Sample(path)
     df = sample.as_dataframe(source="raw")
     # flatten MultiIndex columns (pnn, pns) -> pnn only
@@ -43,10 +49,11 @@ def load_fcs(path: str) -> FcsData:
     return FcsData(
         path=path, filename=os.path.basename(path), df=df,
         channel_ranges=channel_ranges, marker_names=marker_names,
+        spill=parse_spill(meta, source=os.path.basename(path)),
     )
 
 
-_RESERVED_SUBDIRS = {"gates", "exports", "panels", "strategies"}
+_RESERVED_SUBDIRS = {"gates", "exports", "panels", "strategies", "compensation"}
 
 _NUM_RE = re.compile(r"(\d+)")
 
