@@ -2,12 +2,14 @@
 
 Gating, Ca²⁺-Kinetik und Histogramm-Overlays für Durchflusszytometrie-Daten (`.fcs`) —
 eine freie, Python-basierte Alternative für typische FlowJo-Arbeitsschritte, mit grafischer
-Oberfläche (Tkinter + Matplotlib) und einer Batch-Pipeline für die Kommandozeile.
+Oberfläche (Tkinter + Matplotlib).
 
 ## Funktionen
 
-- **Gating** wie in FlowJo: hierarchischer Gate-Baum (Polygon / Rechteck / Ellipse), Gate-Sets
-  speicherbar für alle Dateien, eine Gruppe oder eine einzelne Datei
+- **Gating** wie in FlowJo: hierarchischer Gate-Baum (Polygon / Rechteck / Ellipse / Quadrant,
+  Boolean-Gates UND / ODER / NICHT), Gate-Sets speicherbar für alle Dateien, eine Gruppe oder
+  eine einzelne Datei
+- **FlowJo-Import**: Gates, Gate-Hierarchie und angepasste Kompensation aus einem `.wsp`-Workspace
 - **Kompensation**: Spillover-Matrix aus der FCS-Datei (Standard, wie FACSDiva/FlowJo) oder eine
   eigene Experiment-Matrix; Anpassen per Greifen-und-Ziehen im Plot oder direkt in der NxN-Tabelle
 - **Darstellungen**: Scatter, 2D-Histogramm, Dichte, Konturen; Achsen Linear / Log / Logicle
@@ -64,34 +66,35 @@ reines Python und sollte auch unter macOS/Linux laufen.
 ```
 Flow_Plot/
 ├── pipeline/
-│   ├── gating_gui.py         # GUI (Gating, Kinetik, Statistik, Histogramm-Overlay)
-│   ├── run_pipeline.py       # Batch-Auswertung aller Dateien (Kommandozeile)
-│   ├── define_gates.py       # Gates per Kommandozeile definieren (nur Polygon)
-│   ├── gating.py             # Gate-Sets: Datenmodell, Laden/Speichern, Anwenden
+│   ├── gating_gui.py         # GUI (alle Tabs)
+│   ├── gating.py             # Gates & Gate-Sets: Datenmodell, Laden/Speichern, Anwenden
+│   ├── compensation.py       # Spillover-Matrizen: lesen, anwenden, speichern, CSV
+│   ├── wsp_import.py         # FlowJo-Workspace (.wsp) importieren
+│   ├── panel_export.py       # Panel-Export (viele Statistiken, eine Excel-Tabelle)
 │   ├── kinetics.py           # Ratio, Zeit-Binning, Kinetik- und Ridgeline-Plots
 │   ├── histogram_overlay.py  # Histogramm-Overlays mehrerer Dateien
 │   ├── transforms.py         # Achsen-Transformationen (Linear / Log / Logicle)
 │   ├── io_utils.py           # FCS-Dateien finden und laden
 │   └── clipboard_utils.py    # Plot → Windows-Zwischenablage
-├── gates/                    # gespeicherte Gate-Sets (JSON)
-├── Ca2+_kinetic/             # eigene .fcs-Dateien hier ablegen (nicht im Repo)
-├── output/                   # Ergebnisse der Pipeline (nicht im Repo)
 ├── start.bat                 # Windows: Umgebung einrichten + GUI starten
 └── requirements.txt
 ```
 
-Messdaten (`*.fcs`) und Ergebnisse (`*.csv`, `*.png`, `output/`) werden per `.gitignore`
-bewusst **nicht** versioniert. Die Standard-Ordner lassen sich über `--input-dir`,
-`--gates-dir` und `--output-dir` beliebig ändern; in der GUI kann der Datenordner auch direkt
-gewählt werden.
+Pro Experiment-Ordner (über "Experiment-Ordner wählen..." links in der GUI) legt das Tool
+Unterordner an: `gates/` (Gate-Sets), `strategies/` (ganze Gate-Bäume), `compensation/`
+(Experiment-Matrix), `panels/` (Panel-Vorlagen) und `exports/` (Exporte). Messdaten (`*.fcs`)
+und Ergebnisse (`*.csv`, `*.png`, `exports/`) werden per `.gitignore` bewusst **nicht**
+versioniert. Beim Start lassen sich die Ordner auch über `--input-dir` und `--gates-dir` angeben.
 
 **Dateinamen-Konvention:** Steht im Dateinamen `baseline <N>` (z.B.
 `MEC-1 baseline 60 + Lysate.fcs`), wird das als Baseline-/Stimulus-Zeitpunkt in Sekunden
 gelesen — er wird in den Kinetik-Plots markiert und für Fold-Change und Ridgeline-Farben genutzt.
 
-## Schritt 1: Pregates definieren
+## Bedienung
 
-### Option A: GUI (empfohlen)
+### Start und Gating
+
+Unter Windows `start.bat` doppelklicken, sonst:
 
 ```powershell
 cd pipeline
@@ -157,7 +160,7 @@ auswählen und "Ausgewähltes Kind bearbeiten" klicken (robuster als der Klick a
 Linie, falls der mal knapp daneben trifft).
 
 Das ist besonders nützlich, wenn eine Population von Datei zu Datei leicht verschoben ist:
-Datei wechseln → Gate-Linie anpassen → mit **demselben Namen/Kind-Gates** unter `--scope file`
+Datei wechseln → Gate-Linie anpassen → mit **demselben Namen/Kind-Gates** unter Scope `file`
 für genau diese Datei speichern (siehe Scope-Tabelle oben). Die übrigen Dateien nutzen
 weiterhin das `all`/`group`-Gate mit der ursprünglichen Form, da file-Scope in der
 Priorität vorgeht. Hinweis: Die Baum-Ansicht selbst zeigt nach einer solchen Anpassung die
@@ -195,6 +198,13 @@ Dropdowns oben, direkt am Plot.
 - **Polygon**: Punkte anklicken, letzten Punkt erneut anklicken/doppelklicken zum Schließen
 - **Rectangle**: Ziehen zum Aufziehen, Ecken danach nachziehbar
 - **Ellipse**: wie Rectangle, aber elliptisch (achsenparallel)
+- **Boolean-Gate**: Button "Boolean-Gate (UND / ODER / NICHT)..." unter dem Gate-Baum kombiniert
+  Kind-Gates der aktuell angezeigten Population, z.B. `CD4+` UND NICHT `CD8+` → CD4+CD8-, oder
+  nur NICHT `Debris` → alles im Parent außer Debris. Das neue Gate liegt (wie in FlowJo) unter
+  derselben Population und enthält Kopien der verwendeten Gate-Formen — wird ein verwendetes
+  Gate später umgezeichnet, das Boolean-Gate neu anlegen
+- **Bereichs-Gate (1D)**: entsteht beim FlowJo-Import (z.B. `Comp-PE-A+`), wird als zwei
+  senkrechte Linien angezeigt, sobald der X-Kanal passt
 
 **Scope-Optionen** (beliebig viele Gate-Sets können kombiniert werden, sie werden pro Datei
 per UND verknüpft):
@@ -205,15 +215,35 @@ per UND verknüpft):
 | `group` + Pattern `ZCL278` | gilt für alle Dateien, deren Name `ZCL278` enthält | bedingungsspezifisches Gate |
 | `file` | gilt nur für die aktuell ausgewählte Datei | Ausreißer-Datei manuell nachjustieren |
 
+### FlowJo-Workspace importieren
+
+Links **"FlowJo-Workspace (.wsp) importieren..."**: liest einen FlowJo-Workspace und übernimmt
+nach einer Übersicht (Proben, Populationen, Kompensation) wahlweise:
+
+- **Gate-Sets** — jede Population wird ein Gate-Set (Name wie in FlowJo; kommt ein Name unter
+  mehreren Eltern vor, mit Eltern-Präfix, z.B. `CD3+CD56+/Comp-APC-A+`). Gleiche Gates in allen
+  Proben → Scope `all`; je FlowJo-Gruppe gleich und Gruppenname im Dateinamen → `group`; sonst
+  eine `file`-Variante pro Probe
+- **Gate-Hierarchie** als Gating-Strategie (bei unterschiedlichen Bäumen eine pro Gruppe), die
+  direkt im Gating-Tab geöffnet wird
+- **Kompensation** — die in FlowJo verwendete (ggf. dort bearbeitete) Matrix als
+  Experiment-Matrix; nötig, damit die Gates zu den Daten passen
+
+Polygon-Kanten werden wie in FlowJo auf der Biex-/Logicle-Skala gerade gezogen, Events am
+Skalenrand bleiben in randständigen Gates. Nach dem Import werden die Zählungen der aktuellen
+Datei mit den in FlowJo gespeicherten verglichen; Abweichungen liegen typischerweise unter
+0,5 %, da FlowJos Biex-Berechnung nicht offengelegt ist (die Umrechnung entspricht exakt der
+Auswertung durch FlowKit).
+
 ### Kinetik-Tab (direkt in der GUI)
 
 Im selben Fenster gibt es oben einen zweiten Tab **"Kinetik"**, der sofort die Zeitkinetik der
 aktuell gegateten Population der ausgewählten Datei zeigt — praktisch um den Effekt eines
-Gates sofort zu kontrollieren, ganz ohne die Batch-Pipeline zu starten:
+Gates sofort zu kontrollieren:
 
 - **Einzelkanal**: ein beliebiger Kanal (z.B. `PerCP-A`) über die Zeit
 - **Ratio (Kanal A / Kanal B)**: z.B. `PerCP-A / Qdot 655-A`, mit einstellbarem "Min. Signal"
-  (Rausch-Ausschluss) wie in der Batch-Pipeline
+  (Rausch-Ausschluss)
 - **Bin-Breite** einstellbar, rote Linie markiert das erkannte Ende der Baseline
 - **Darstellung**: Median oder Mittelwert pro Bin (± SEM), Einzel-Events als Punkte oder als
   Dichte-Heatmap, oder **Ridgeline** (eine Verteilung pro Zeitfenster, Kämme vor/nach dem
@@ -242,9 +272,8 @@ Gates sofort zu kontrollieren, ganz ohne die Batch-Pipeline zu starten:
   in Excel/Prism/Python leicht Overlays aller Kinetiken übereinander zeichnen (z.B. nach
   `filename` filtern/pivotieren)
 - **"Alle Kinetik-Plots als PNG exportieren"**: schreibt für jede Datei im Ordner einen
-  einzelnen Kinetik-Plot als PNG (`<Dateiname>_kinetics.png`) in einen frei wählbaren Zielordner
-  — dieselben Plots wie `run_pipeline.py` erzeugt, aber direkt aus der GUI mit den aktuellen
-  Kanal-/Ratio-/Bin-Einstellungen, ohne Kommandozeile
+  einzelnen Kinetik-Plot als PNG (`<Dateiname>_kinetics.png`) in einen frei wählbaren Zielordner,
+  mit den aktuellen Kanal-/Ratio-/Bin-Einstellungen
 - **"Plot in Zwischenablage kopieren"** (verfügbar im Gating-, Kinetik- und Statistik-Tab):
   kopiert den aktuell angezeigten Plot als Bild in die Windows-Zwischenablage — direkt mit
   **Strg+V** in PowerPoint, Word o.ä. einfügbar, kein Screenshot nötig
@@ -304,8 +333,6 @@ auch direkt in der NxN-Tabelle (in %) eintippen; Klick auf eine Zelle zeigt das 
 **"Speichern & auf alle Dateien anwenden"** speichert die Experiment-Matrix und schaltet alle Tabs
 darauf um. Gates auf Fluoreszenzkanälen danach kurz kontrollieren.
 
-Die CLI-Pipeline (`run_pipeline.py`) rechnet weiterhin auf Rohdaten.
-
 ### Panel-Export-Tab (direkt in der GUI)
 
 Tab **"Panel-Export"**: mehrere Messgrößen auf einmal für alle Dateien, als eine
@@ -326,73 +353,11 @@ Tabelle im Wide-Format (eine Zeile pro Probe, eine Spalte pro Population | Marke
 - Export als **Excel** (Blatt "Daten" mit Heatmap pro Spalte, "Panel" = Definition,
   "Gates" = verwendete Gate-Variante je Datei) oder als CSV.
 
-### Option B: CLI (nicht-interaktiv, nur Polygon)
-
-```powershell
-cd pipeline
-python define_gates.py --sample "..\Ca2+_kinetic\Lysate Buffer_MEC-1 baseline 60 + Lysate.fcs" --name cells_singlets --scope all
-```
-
-Gleiches Prinzip wie oben, aber nur Polygon-Gates, Kanalpaare per `--steps` und Reihenfolge
-fix vorgegeben (praktisch für Skripting/Wiederholung). Details siehe `--help`.
-
-## Schritt 2: Pipeline laufen lassen
-
-```powershell
-cd pipeline
-python run_pipeline.py
-```
-
-Wichtige Optionen (alle optional, mit sinnvollen Defaults):
-
-```powershell
-python run_pipeline.py `
-  --input-dir "..\Ca2+_kinetic" `
-  --gates-dir "..\gates" `
-  --output-dir "..\output" `
-  --num-channel "PerCP-A" `
-  --denom-channel "Qdot 655-A" `
-  --bin-width-s 1.0 `
-  --min-signal 1.0 `
-  --pos-threshold 3.0
-```
-
-`--pos-threshold` ist optional: wenn gesetzt, ergänzt `summary.csv` pro Datei `n_positive`,
-`pct_positive`, `n_negative`, `pct_negative` (Ratio > Schwelle = positiv). Für interaktives
-Austesten der Schwelle und Kohorten-Export eignet sich der Statistik-Tab der GUI besser,
-da man die Schwelle dort direkt im Histogramm anklicken kann.
-
-**Wichtig bei mehreren Populationen:** Hat man mehrere gespeicherte Gate-Sets mit
-überlappendem Scope (z.B. "Lebend" und "Dead", beide `all`), werden ohne `--gate-set-name`
-**alle** zum Dateinamen passenden Gate-Sets per UND verknüpft — bei sich ausschließenden
-Populationen ergibt das eine (fast) leere Schnittmenge statt einer der beiden Populationen
-(die Pipeline warnt in diesem Fall). Mit `--gate-set-name Lebend` wird gezielt nur dieses eine
-Gate-Set angewendet (seine file/group/all-Varianten werden weiterhin mit Priorität aufgelöst).
-Die Ausgabedateien (`summary.csv`, `*_kinetics.csv/png`) bekommen dann automatisch den
-Gate-Set-Namen angehängt, sodass ein zweiter Lauf mit `--gate-set-name Dead` nichts überschreibt.
-
-## Output (`output/`)
-
-Pro Datei:
-- `<name>_kinetics.csv` — Zeit-Bins mit `n_events`, `median_ratio`, `mean_ratio`, `sem_ratio`
-- `<name>_kinetics.png` — Ratio-Kinetik-Plot, rote gestrichelte Linie = erkanntes Ende der
-  Baseline (aus `"baseline <N>"` im Dateinamen, z.B. `baseline 60` → 60 s)
-- `<name>_gating_qc.png` — Kontrollplot: welche Events wurden vom Gate behalten/verworfen
-
-Zusätzlich:
-- `summary.csv` — eine Zeile pro Datei: Baseline-Ratio, Peak-Ratio, Peak-Zeitpunkt, Fold-Change,
-  Anzahl gegateter Events, optional (mit `--pos-threshold`) %positive/%negative
-- Kohorten-Statistik-CSV (Count/%positive/%negative je Kanal oder Ratio, frei wählbare
-  Schwelle) über den **Statistik-Tab** der GUI exportierbar — Speicherort frei wählbar
-
 ## Hinweise
 
-- Ratio wird nur aus Events berechnet, bei denen **beide** Kanäle > `--min-signal` sind
+- Ratio wird nur aus Events berechnet, bei denen **beide** Kanäle > "Min. Signal" sind
   (Default 1.0), um Rauschen nahe Null/negative Rohwerte (treten in FCS-Rohdaten normal auf)
   nicht als Artefakte ins Ratio einfließen zu lassen.
-- Ohne definierte Gates läuft die Pipeline trotzdem (mit Warnung) auf der ungegateten
-  Population — praktisch zum schnellen Testen, aber für echte Auswertung sollten vorher
-  Gates definiert werden.
 - Die Zeitachse (`Time`-Kanal) ist bereits in Sekunden (FlowKit skaliert automatisch mit
   `$TIMESTEP` aus der FCS-Datei).
 

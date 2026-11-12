@@ -46,6 +46,7 @@ from gating import (
     list_saved_strategies,
     load_all_gate_sets,
     load_gate_tree,
+    make_boolean_step,
     new_gate_tree,
     node_mask,
     node_path,
@@ -81,6 +82,7 @@ from compensation import (
     save_matrix,
 )
 from io_utils import FcsData, find_fcs_files, load_fcs
+from wsp_import import compare_counts, plan_import, read_workspace
 from kinetics import (
     KIN_DISPLAY_MEDIAN,
     KIN_DISPLAY_RIDGE,
@@ -247,6 +249,9 @@ class GatingApp(ttk.Frame):
             fill="x", padx=4, pady=(2, 2)
         )
         ttk.Button(left, text="Dateien neu einlesen (Ordner erneut scannen)", command=self._rescan_files).pack(
+            fill="x", padx=4, pady=(0, 2)
+        )
+        ttk.Button(left, text="FlowJo-Workspace (.wsp) importieren...", command=self._import_wsp).pack(
             fill="x", padx=4, pady=(0, 2)
         )
         ttk.Label(
@@ -556,6 +561,9 @@ class GatingApp(ttk.Frame):
         ttk.Button(tree_btns, text="Ausgewählten Knoten umbenennen", command=self._rename_tree_selected).pack(fill="x", pady=2)
         ttk.Button(
             tree_btns, text="Ausgewählten Knoten bearbeiten (Ecken anpassen)", command=self._edit_tree_selected
+        ).pack(fill="x", pady=2)
+        ttk.Button(
+            tree_btns, text="Boolean-Gate (UND / ODER / NICHT)...", command=self._create_boolean_gate
         ).pack(fill="x", pady=2)
         ttk.Button(tree_btns, text="Ausgewählten Knoten + Kinder löschen", command=self._delete_tree_selected).pack(fill="x", pady=2)
         ttk.Button(tree_btns, text="Baum zurücksetzen", command=self._reset_tree).pack(fill="x", pady=2)
@@ -2673,6 +2681,163 @@ class GatingApp(ttk.Frame):
             return
         messagebox.showinfo("Exportiert", f"Panel-Export gespeichert unter:\n{path}")
 
+    # ---------------------------------------------------------- FlowJo workspace import
+    def _import_wsp(self):
+        path = filedialog.askopenfilename(
+            title="FlowJo-Workspace importieren", filetypes=[("FlowJo-Workspace", "*.wsp"), ("Alle", "*.*")],
+            initialdir=self.input_dir if os.path.isdir(self.input_dir) else os.getcwd(),
+        )
+        if not path:
+            return
+        self.config(cursor="watch")
+        self.status_var.set("Lese FlowJo-Workspace ...")
+        self.update_idletasks()
+        try:
+            ws = read_workspace(path)
+            plan = plan_import(ws, [os.path.basename(p) for p in self.fcs_paths])
+        except Exception as exc:
+            messagebox.showerror("Import fehlgeschlagen", f"Der Workspace konnte nicht gelesen werden:\n{exc}")
+            self.status_var.set("Workspace-Import fehlgeschlagen.")
+            return
+        finally:
+            self.config(cursor="")
+        self._show_wsp_import_dialog(ws, plan)
+
+    def _show_wsp_import_dialog(self, ws, plan):
+        win = tk.Toplevel(self)
+        win.title("FlowJo-Workspace importieren")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        new_names = {gs.name for gs, _ in plan.gate_sets}
+        replaced = sorted({gs.name for gs in self.existing_gate_sets if gs.name in new_names})
+        n_pops = len(plan.names)
+        scope_txt = ", ".join(f"{n}× {k}" for k, n in plan.scope_summary.items())
+        lines = [
+            f"Workspace: {os.path.basename(ws.path)}",
+            f"Proben: {len(ws.samples)} — davon {len(plan.matched)} mit passender .fcs-Datei in diesem Experiment"
+            + (f" (ohne Datei: {', '.join(plan.unmatched[:5])}{' …' if len(plan.unmatched) > 5 else ''})"
+               if plan.unmatched else ""),
+            f"Populationen: {n_pops}  →  {len(plan.gate_sets)} Gate-Set-Datei(en) ({scope_txt})",
+            f"Gating-Strategie(n): {', '.join(n for n, _ in plan.strategies)}",
+            f"Kompensation: {ws.comp_note}",
+        ]
+        if not plan.matched:
+            lines.append("ACHTUNG: keine Probe passt zu einer .fcs-Datei im aktuellen Experiment-Ordner.")
+        ttk.Label(win, text="\n".join(lines), justify="left", wraplength=640).pack(anchor="w", padx=10, pady=(10, 6))
+
+        do_gates = tk.BooleanVar(value=True)
+        do_strategy = tk.BooleanVar(value=True)
+        do_comp = tk.BooleanVar(value=ws.comp is not None)
+        ttk.Checkbutton(
+            win, text="Gate-Sets übernehmen (in Statistik / Kinetik / Panel-Export als Populationen wählbar)",
+            variable=do_gates,
+        ).pack(anchor="w", padx=10)
+        if replaced:
+            ttk.Label(
+                win, text=f"   ersetzt {len(replaced)} vorhandene Gate-Set(s) gleichen Namens: "
+                + ", ".join(replaced[:8]) + (" …" if len(replaced) > 8 else ""),
+                foreground="#a33", wraplength=620, justify="left",
+            ).pack(anchor="w", padx=10)
+        ttk.Checkbutton(
+            win, text="Gate-Hierarchie als Gating-Strategie speichern und im Gating-Tab öffnen", variable=do_strategy
+        ).pack(anchor="w", padx=10)
+        comp_cb = ttk.Checkbutton(
+            win, text="Kompensationsmatrix als Experiment-Matrix übernehmen und aktivieren (nötig, damit die "
+            "Gates zu den Daten passen)", variable=do_comp,
+        )
+        comp_cb.pack(anchor="w", padx=10)
+        if ws.comp is None:
+            comp_cb.state(["disabled"])
+        if ws.warnings:
+            ttk.Label(
+                win, text="Hinweise:\n" + "\n".join(ws.warnings[:10])
+                + (f"\n… und {len(ws.warnings) - 10} weitere" if len(ws.warnings) > 10 else ""),
+                foreground="#a33", justify="left", wraplength=640,
+            ).pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(
+            win, text="Gate-Kanten werden wie in FlowJo auf der Biex-/Logicle-Skala gerade gezogen. Kleine Abweichungen "
+            "zu FlowJos Zählungen (meist < 0,5 %) entstehen, weil FlowJos Biex-Berechnung nicht offengelegt ist.",
+            foreground="#555", wraplength=640, justify="left",
+        ).pack(anchor="w", padx=10, pady=(6, 0))
+
+        def run():
+            win.destroy()
+            self._apply_wsp_import(ws, plan, do_gates.get(), do_strategy.get(), do_comp.get(), replaced)
+
+        btns = ttk.Frame(win)
+        btns.pack(anchor="e", padx=10, pady=10)
+        ttk.Button(btns, text="Importieren", command=run).pack(side="left", padx=4)
+        ttk.Button(btns, text="Abbrechen", command=win.destroy).pack(side="left")
+
+    def _apply_wsp_import(self, ws, plan, do_gates: bool, do_strategy: bool, do_comp: bool, replaced: list[str]):
+        done = []
+        try:
+            if do_comp and ws.comp is not None:
+                matrix = ws.comp.copy()
+                save_matrix(matrix, os.path.join(self.comp_dir, COMP_MATRIX_FILE))
+                self.experiment_comp = matrix
+                self.comp_work = None
+                self.comp_mode = "experiment"
+                self.comp_mode_var.set(COMP_MODES["experiment"])
+                self._save_comp_settings()
+                done.append(f"Kompensation '{matrix.name}' als Experiment-Matrix aktiv")
+            if do_gates:
+                for gs in self.existing_gate_sets:
+                    if gs.name in replaced and gs.source_path and os.path.exists(gs.source_path):
+                        os.remove(gs.source_path)
+                for gs, stem in plan.gate_sets:
+                    save_gate_set(gs, self.gates_dir, file_stem=stem)
+                self.existing_gate_sets = load_all_gate_sets(self.gates_dir)
+                self._refresh_existing_listbox()
+                # the preview ANDs every saved gate-set — with mutually exclusive imported
+                # populations (e.g. 'Comp-PE-A+' / 'Comp-PE-A-') that would be empty
+                self.show_existing_var.set(False)
+                done.append(f"{len(plan.gate_sets)} Gate-Set-Datei(en) in gates/")
+            strategy_paths = []
+            if do_strategy:
+                for name, tree in plan.strategies:
+                    strategy_paths.append((save_gate_tree(tree, name, self.strategies_dir), name))
+                self._refresh_strategy_combo()
+                done.append(f"{len(strategy_paths)} Gating-Strategie(n)")
+        except OSError as exc:
+            messagebox.showerror("Import unvollständig", f"Schreiben fehlgeschlagen:\n{exc}")
+            return
+
+        self._invalidate_compensated_data()
+        if strategy_paths and self._confirm_discard_current_strategy():
+            path, name = strategy_paths[0]
+            self._load_strategy(path, name)
+            self.strategy_var.set(name)
+
+        report = self._wsp_count_report(ws)
+        messagebox.showinfo("Import abgeschlossen", "Übernommen:\n– " + "\n– ".join(done or ["nichts"]) + report)
+        self.status_var.set("FlowJo-Workspace importiert: " + "; ".join(done))
+
+    def _wsp_count_report(self, ws) -> str:
+        """Plausibility check on the currently shown file: our counts vs FlowJo's."""
+        if not self.current_path:
+            return ""
+        name = os.path.basename(self.current_path)
+        sample = ws.samples.get(name) or next(iter(ws.samples.values()), None)
+        if sample is None or sample.name not in [os.path.basename(p) for p in self.fcs_paths]:
+            return ""
+        path = next(p for p in self.fcs_paths if os.path.basename(p) == sample.name)
+        try:
+            table = compare_counts(sample, self._get_data(path).df)
+        except Exception as exc:
+            return f"\n\nAbgleich mit FlowJo nicht möglich: {exc}"
+        dev = table.dropna(subset=["Abweichung %"])
+        dev = dev[dev["FlowJo"] >= 100]
+        if dev.empty:
+            return ""
+        worst = dev.loc[dev["Abweichung %"].abs().idxmax()]
+        return (
+            f"\n\nAbgleich mit FlowJos Zählungen für '{sample.name}' ({len(dev)} Populationen ≥ 100 Events):\n"
+            f"mittlere Abweichung {dev['Abweichung %'].abs().mean():.2f} %, größte {worst['Abweichung %']:+.2f} % "
+            f"({worst['Population']}: FlowJo {int(worst['FlowJo'])}, hier {int(worst['Dieses Tool'])})"
+        )
+
     # ---------------------------------------------------------- experiment folder
     def _choose_experiment_folder(self):
         chosen = filedialog.askdirectory(
@@ -3350,10 +3515,14 @@ class GatingApp(ttk.Frame):
         drawn_quadrant_centers = set()
         for i, child_id in enumerate(self.gate_tree[self.current_node_id].children):
             step = self.gate_tree[child_id].step
-            if step.x_channel != x_ch or step.y_channel != y_ch:
-                continue
             color = default_color(i)
             label_kw = dict(ha="center", fontsize=8, fontweight="bold", path_effects=halo_text, zorder=8)
+            if step.shape == "range":
+                if step.x_channel == x_ch:
+                    self._draw_range_gate(ax, step, self.gate_tree[child_id].name, color, i, halo_line, label_kw)
+                continue
+            if step.x_channel != x_ch or step.y_channel != y_ch:
+                continue
             if step.shape == "quadrant":
                 p = step.params
                 key = (p["cx"], p["cy"], p.get("angle_deg", 0.0))
@@ -3374,6 +3543,38 @@ class GatingApp(ttk.Frame):
             else:
                 cx, cy = patch.get_path().vertices.mean(axis=0)
             ax.annotate(self.gate_tree[child_id].name, (cx, cy), color=color, **label_kw)
+
+    @staticmethod
+    def _draw_range_gate(ax, step: GateStep, name: str, color, index: int, halo_line, label_kw):
+        """1D range gate (e.g. imported FlowJo 'Comp-PE-A+'): its bounds as
+        vertical lines, a bracket and the name a bit below the top — staggered
+        per gate so neighbouring ranges don't print over each other."""
+        lo, hi = step.params.get("min"), step.params.get("max")
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        for v in (lo, hi):
+            if v is not None:
+                ax.axvline(v, color=color, lw=1.6, path_effects=halo_line, zorder=7)
+        x0 = xlim[0] if lo is None else max(lo, xlim[0])
+        x1 = xlim[1] if hi is None else min(hi, xlim[1])
+        frac = 0.92 - 0.06 * (index % 6)
+        if ax.get_yscale() == "linear":
+            y = ylim[0] + frac * (ylim[1] - ylim[0])
+        else:  # log-like Y: place in display space
+            y = ax.transData.inverted().transform(ax.transAxes.transform((0, frac)))[1]
+        ax.plot([x0, x1], [y, y], color=color, lw=1.4, scalex=False, scaley=False, zorder=7)
+        try:
+            xm = ax.transData.inverted().transform(
+                (np.mean([ax.transData.transform((x0, y))[0], ax.transData.transform((x1, y))[0]]), 0)
+            )[0]
+        except Exception:
+            xm = (x0 + x1) / 2
+        ax.annotate(name, (xm, y), color=color, va="bottom", **label_kw)
+
+    @staticmethod
+    def _step_on_axes(step: GateStep, x_ch: str, y_ch: str) -> bool:
+        if step.shape == "range":
+            return step.x_channel == x_ch
+        return step.x_channel == x_ch and step.y_channel == y_ch
 
     def _overlay_quadrant_preview(self, ax, x_ch: str, y_ch: str):
         """While a quadrant gate is being placed: once its center is picked,
@@ -3519,6 +3720,111 @@ class GatingApp(ttk.Frame):
         else:
             self._redraw()
 
+    # ---------------------------------------------------------- boolean gates
+    def _create_boolean_gate(self):
+        """Combine child gates of the CURRENT population with AND / OR / NOT
+        into a new child gate (like FlowJo's Boolean gates). The new gate
+        stores copies of the referenced gates' shapes, so it stays valid when
+        saved as a gate-set on its own; reshaping a referenced gate later does
+        NOT update it (delete + recreate the boolean gate then)."""
+        self._cancel_drawing()
+        parent_id = self.current_node_id
+        children = [c for c in self.gate_tree[parent_id].children]
+        if not children:
+            messagebox.showinfo(
+                "Keine Kind-Gates",
+                "Boolean-Gates kombinieren Gates, die DIREKT unter der aktuell angezeigten Population liegen. "
+                f"'{self.gate_tree[parent_id].name}' hat noch keine Kind-Gates — erst zeichnen, dann kombinieren."
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Boolean-Gate erstellen")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        ttk.Label(
+            win, text=f"Neues Kind-Gate unter '{self.gate_tree[parent_id].name}' aus diesen Kind-Gates:",
+            font=("", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 4))
+
+        op_var = tk.StringVar(value="and")
+        op_frame = ttk.Frame(win)
+        op_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=8)
+        ttk.Label(op_frame, text="Verknüpfung:").pack(side="left")
+        ttk.Radiobutton(op_frame, text="UND (alle Bedingungen)", variable=op_var, value="and").pack(side="left", padx=4)
+        ttk.Radiobutton(op_frame, text="ODER (mindestens eine)", variable=op_var, value="or").pack(side="left", padx=4)
+
+        ttk.Label(win, text="verwenden").grid(row=2, column=0, padx=8, pady=(8, 0))
+        ttk.Label(win, text="NICHT").grid(row=2, column=1, padx=8, pady=(8, 0))
+        ttk.Label(win, text="Gate").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        rows = []
+        for r, cid in enumerate(children, start=3):
+            use, neg = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
+            ttk.Checkbutton(win, variable=use).grid(row=r, column=0)
+            ttk.Checkbutton(win, variable=neg).grid(row=r, column=1)
+            node = self.gate_tree[cid]
+            ttk.Label(win, text=f"{node.name}   ({node.step.describe()})", foreground="#333").grid(
+                row=r, column=2, sticky="w", padx=(0, 8)
+            )
+            rows.append((cid, use, neg))
+        r = len(children) + 3
+        ttk.Label(
+            win, text="Beispiele: 'CD4+' UND NICHT 'CD8+' → CD4+CD8-.  Nur ein Gate mit NICHT → alles im Parent "
+            "außer diesem Gate.", foreground="#555", wraplength=460, justify="left",
+        ).grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(win, text="Name:").grid(row=r + 1, column=0, sticky="e", padx=8)
+        name_var = tk.StringVar(value="")
+        name_entry = ttk.Entry(win, textvariable=name_var, width=40)
+        name_entry.grid(row=r + 1, column=1, columnspan=2, sticky="w", pady=4)
+
+        def selected_terms():
+            return [(cid, neg.get()) for cid, use, neg in rows if use.get()]
+
+        def suggested_name(*_):
+            terms = selected_terms()
+            joiner = " & " if op_var.get() == "and" else " | "
+            return joiner.join(("NOT " if n else "") + self.gate_tree[c].name for c, n in terms)
+
+        last_suggestion = {"text": ""}
+
+        def update_name(*_):
+            if name_var.get() in ("", last_suggestion["text"]):
+                last_suggestion["text"] = suggested_name()
+                name_var.set(last_suggestion["text"])
+
+        for _, use, neg in rows:
+            use.trace_add("write", update_name)
+            neg.trace_add("write", update_name)
+        op_var.trace_add("write", update_name)
+
+        def create():
+            terms = selected_terms()
+            if not terms:
+                messagebox.showwarning("Keine Gates gewählt", "Bitte mindestens ein Gate anhaken.", parent=win)
+                return
+            if len(terms) == 1 and not terms[0][1]:
+                messagebox.showwarning(
+                    "Nur ein Gate", "Ein einzelnes Gate ohne NICHT wäre identisch mit dem Gate selbst.", parent=win
+                )
+                return
+            name = name_var.get().strip() or suggested_name()
+            step = make_boolean_step(
+                op_var.get(), [(self.gate_tree[c].name, [self.gate_tree[c].step], n) for c, n in terms]
+            )
+            node_id = f"node_{self._node_counter}"
+            self._node_counter += 1
+            add_child_node(self.gate_tree, parent_id, step, name, node_id)
+            self._mark_strategy_dirty()
+            win.destroy()
+            self._redraw()
+            self.status_var.set(f"Boolean-Gate '{name}' erstellt: {step.describe()}")
+
+        btns = ttk.Frame(win)
+        btns.grid(row=r + 2, column=0, columnspan=3, sticky="e", padx=8, pady=8)
+        ttk.Button(btns, text="Erstellen", command=create).pack(side="left", padx=4)
+        ttk.Button(btns, text="Abbrechen", command=win.destroy).pack(side="left")
+        name_entry.focus_set()
+
     # ---------------------------------------------------------- tree navigation
     def _navigate_to(self, node_id: str):
         self._cancel_drawing()
@@ -3556,7 +3862,7 @@ class GatingApp(ttk.Frame):
         if event.dblclick:
             for child_id in self.gate_tree[self.current_node_id].children:
                 step = self.gate_tree[child_id].step
-                if step.x_channel == x_ch and step.y_channel == y_ch and point_in_step(step, event.xdata, event.ydata):
+                if self._step_on_axes(step, x_ch, y_ch) and point_in_step(step, event.xdata, event.ydata):
                     self._navigate_to(child_id)
                     return
             return
@@ -3639,6 +3945,13 @@ class GatingApp(ttk.Frame):
             return
         node = self.gate_tree[node_id]
         step = node.step
+        if step.shape in ("boolean", "range"):
+            what = "Boolean-Gates" if step.shape == "boolean" else "Bereichs-Gates (1D)"
+            messagebox.showinfo(
+                "Nicht unterstützt",
+                f"{what} haben keine Ecken zum Verschieben ({step.describe()}). Bitte löschen und neu anlegen."
+            )
+            return
         if step.shape == "quadrant":
             messagebox.showinfo(
                 "Nicht unterstützt",

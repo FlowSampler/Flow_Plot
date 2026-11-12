@@ -21,7 +21,14 @@ just its 4 corners), "ellipse" (axis-aligned, center cx/cy and radii rx/ry in
 "params") or "quadrant" (one quarter of the plane split by two perpendicular
 lines crossing at cx/cy, optionally rotated by angle_deg; params also carry
 x_sign/y_sign, each "+" or "-", selecting which of the four quarters this
-step keeps). Omitting "shape" defaults to "polygon" for backward compatibility.
+step keeps), "range" (1D gate on x_channel only, params {"min", "max"},
+either may be null = unbounded; y_channel is "") or "boolean" (no channels;
+params {"op": "and" | "or", "terms": [{"name": str, "not": bool, "steps":
+[step dicts]}, ...]} — each term is a population given by its own gate
+steps, optionally negated, and the terms are combined with AND / OR; a NOT
+gate is "and" with one negated term). Like every step, a boolean step is
+ANDed with the steps before it, so it always stays inside its parent.
+Omitting "shape" defaults to "polygon" for backward compatibility.
 
 scope.type is one of:
   - "all":   applies to every .fcs file in the input directory
@@ -53,6 +60,17 @@ class GateStep:
     params: dict | None = None  # ellipse: {"cx", "cy", "rx", "ry"}
 
     def mask(self, df: pd.DataFrame) -> np.ndarray:
+        if self.shape == "boolean":
+            return boolean_mask(df, self.params)
+        if self.shape == "range":
+            x = df[self.x_channel].to_numpy()
+            lo, hi = self.params.get("min"), self.params.get("max")
+            mask = np.ones(len(x), dtype=bool)
+            if lo is not None:
+                mask &= x >= lo
+            if hi is not None:
+                mask &= x < hi
+            return mask
         x = df[self.x_channel].to_numpy()
         y = df[self.y_channel].to_numpy()
         if self.shape in ("polygon", "rectangle"):
@@ -75,6 +93,58 @@ class GateStep:
             mask &= (s_y >= 0) if p["y_sign"] == "+" else (s_y < 0)
             return mask
         raise ValueError(f"Unknown gate shape: {self.shape!r}")
+
+    @property
+    def is_boolean(self) -> bool:
+        return self.shape == "boolean"
+
+    def describe(self) -> str:
+        if self.shape == "boolean":
+            return boolean_description(self.params)
+        if self.shape == "range":
+            lo, hi = self.params.get("min"), self.params.get("max")
+            return f"{self.x_channel}: {'-∞' if lo is None else f'{lo:g}'} … {'∞' if hi is None else f'{hi:g}'}"
+        return f"{self.shape} {self.x_channel} / {self.y_channel}"
+
+
+def step_from_dict(d: dict) -> GateStep:
+    return GateStep(
+        x_channel=d.get("x_channel", ""), y_channel=d.get("y_channel", ""), shape=d.get("shape", "polygon"),
+        vertices=d.get("vertices"), params=d.get("params"),
+    )
+
+
+def boolean_mask(df: pd.DataFrame, params: dict) -> np.ndarray:
+    op = params.get("op", "and")
+    result = np.ones(len(df), dtype=bool) if op == "and" else np.zeros(len(df), dtype=bool)
+    for term in params.get("terms", []):
+        m = np.ones(len(df), dtype=bool)
+        for s in term.get("steps", []):
+            m &= step_from_dict(s).mask(df)
+        if term.get("not"):
+            m = ~m
+        if op == "and":
+            result &= m
+        else:
+            result |= m
+    return result
+
+
+def boolean_description(params: dict) -> str:
+    word = " UND " if params.get("op", "and") == "and" else " ODER "
+    return word.join(("NICHT " if t.get("not") else "") + t.get("name", "?") for t in params.get("terms", []))
+
+
+def make_boolean_step(op: str, terms: list[tuple[str, list[GateStep], bool]]) -> GateStep:
+    """terms: (population name, its gate steps, negate). op: 'and' | 'or'."""
+    if op not in ("and", "or"):
+        raise ValueError(f"Unknown boolean operator {op!r}")
+    return GateStep(
+        x_channel="", y_channel="", shape="boolean",
+        params={"op": op, "terms": [
+            {"name": name, "not": bool(neg), "steps": [_step_to_dict(s) for s in steps]} for name, steps, neg in terms
+        ]},
+    )
 
 
 @dataclass
@@ -108,7 +178,7 @@ class GateSet:
 def load_gate_set(path: str) -> GateSet:
     with open(path, "r", encoding="utf-8") as fh:
         raw = json.load(fh)
-    steps = [GateStep(**s) for s in raw.get("steps", [])]
+    steps = [step_from_dict(s) for s in raw.get("steps", [])]
     return GateSet(name=raw["name"], scope=raw["scope"], steps=steps, source_path=path)
 
 
@@ -122,24 +192,21 @@ def load_all_gate_sets(gates_dir: str) -> list[GateSet]:
     return gate_sets
 
 
-def save_gate_set(gate_set: GateSet, gates_dir: str) -> str:
+def safe_file_stem(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def save_gate_set(gate_set: GateSet, gates_dir: str, file_stem: str | None = None) -> str:
+    """file_stem: explicit file name (without .json) — needed when several
+    scope variants of the same name are saved side by side (e.g. one per
+    file), which would otherwise overwrite each other."""
     os.makedirs(gates_dir, exist_ok=True)
     payload = {
         "name": gate_set.name,
         "scope": gate_set.scope,
-        "steps": [
-            {
-                "x_channel": s.x_channel,
-                "y_channel": s.y_channel,
-                "shape": s.shape,
-                "vertices": s.vertices,
-                "params": s.params,
-            }
-            for s in gate_set.steps
-        ],
+        "steps": [_step_to_dict(s) for s in gate_set.steps],
     }
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in gate_set.name)
-    out_path = os.path.join(gates_dir, f"{safe_name}.json")
+    out_path = os.path.join(gates_dir, f"{file_stem or safe_file_stem(gate_set.name)}.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     return out_path
@@ -235,6 +302,10 @@ def node_mask(df: pd.DataFrame, tree: dict[str, GateNode], node_id: str, base_ma
 
 def point_in_step(step: GateStep, x: float, y: float) -> bool:
     """Single-point hit test, used for click/double-click-into-gate navigation."""
+    if step.shape == "boolean":
+        return False
+    if step.shape == "range":
+        return bool(step.mask(pd.DataFrame({step.x_channel: [x]}))[0])
     df = pd.DataFrame({step.x_channel: [x], step.y_channel: [y]})
     return bool(step.mask(df)[0])
 
@@ -313,7 +384,7 @@ def load_gate_tree(path: str) -> tuple[dict[str, GateNode], int]:
     tree: dict[str, GateNode] = {}
     for node_id, n in raw["nodes"].items():
         step_dict = n.get("step")
-        step = GateStep(**step_dict) if step_dict else None
+        step = step_from_dict(step_dict) if step_dict else None
         tree[node_id] = GateNode(
             node_id=node_id, parent_id=n.get("parent_id"), step=step,
             name=n.get("name", ""), children=list(n.get("children", [])),
