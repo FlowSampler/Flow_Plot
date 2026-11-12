@@ -3,10 +3,14 @@
 FlowKit parses the workspace (FlowJo's Gating-ML flavour). This module turns
 its per-sample gating strategies into this tool's model:
 
-  - every population becomes a GateSet (root -> population path of GateSteps)
-    with scope "all" if all samples share the identical gate definition,
-    "group" if a FlowJo group's samples share it (and the group name appears
-    in their file names), otherwise one "file"-scoped variant per sample;
+  - every population becomes a GateSet (root -> population path of GateSteps):
+    the most common definition gets scope "all"; samples whose gate (or any
+    gate above it) was adjusted individually get their own variant — "group"
+    if exactly one FlowJo group's samples deviate the same way and the group
+    name appears in their file names, otherwise one "file" variant per sample.
+    Per file only the most specific variant is used, so adjusted samples
+    never mix with the "all" gate. (If some samples lack the population
+    entirely, there is no "all" variant, only group/file ones.)
   - every distinct gate tree becomes a gating strategy (whole editable tree);
   - the compensation matrix FlowJo used for the samples becomes the
     experiment matrix.
@@ -25,7 +29,6 @@ polygons (FlowKit converts them), Boolean gates become "boolean" steps and
 from __future__ import annotations
 
 import collections
-import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -34,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from compensation import CompMatrix
-from gating import GateNode, GateSet, GateStep, _step_to_dict, make_boolean_step, safe_file_stem
+from gating import GateNode, GateSet, GateStep, _step_to_dict, gate_set_file_stem, make_boolean_step
 
 BIG = 1e12
 EDGE_POINTS = 24  # points per polygon edge when the axes are non-linear
@@ -270,13 +273,6 @@ def population_names(paths: list[Path]) -> dict:
     return names
 
 
-def _stem(name: str, suffix: str = "") -> str:
-    stem = safe_file_stem(name) + (f"__{safe_file_stem(suffix)}" if suffix else "")
-    if len(stem) > 120:
-        stem = stem[:100] + "_" + hashlib.md5(stem.encode()).hexdigest()[:10]
-    return stem
-
-
 @dataclass
 class ImportPlan:
     gate_sets: list  # (GateSet, file stem)
@@ -311,21 +307,26 @@ def plan_import(ws: WspWorkspace, experiment_files: list[str]) -> ImportPlan:
             if steps is not None:
                 defs.setdefault(_def_key(steps), (steps, []))[1].append(s)
         name = names[p]
-        if len(defs) == 1 and len(next(iter(defs.values()))[1]) == len(use):
-            steps, _ = next(iter(defs.values()))
-            gate_sets.append((GateSet(name, {"type": "all"}, steps), _stem(name)))
+        clusters = list(defs.values())
+        if sum(len(m) for _, m in clusters) == len(use):
+            # every sample has this population: the most common definition becomes
+            # 'all', samples whose gate was adjusted individually get their own
+            # variant (file > group > all, so they never fall back to 'all')
+            clusters.sort(key=lambda c: -len(c[1]))
+            steps, _ = clusters.pop(0)
+            gate_sets.append(GateSet(name, {"type": "all"}, steps))
             scopes["all"] += 1
-            continue
-        for steps, members in defs.values():
+        # else: some samples lack it — no 'all' variant, or they would gain a population FlowJo doesn't have
+        for steps, members in clusters:
             group = _matching_group(members, use, candidate_groups)
             if group:
-                gate_sets.append((GateSet(name, {"type": "group", "pattern": group}, steps), _stem(name, "grp_" + group)))
+                gate_sets.append(GateSet(name, {"type": "group", "pattern": group}, steps))
                 scopes["group"] += 1
             else:
                 for s in members:
-                    gate_sets.append((GateSet(name, {"type": "file", "filename": s}, steps),
-                                      _stem(name, os.path.splitext(s)[0])))
+                    gate_sets.append(GateSet(name, {"type": "file", "filename": s}, steps))
                     scopes["file"] += 1
+    gate_sets = [(gs, gate_set_file_stem(gs)) for gs in gate_sets]
 
     strategies = _plan_strategies(ws, use, all_paths)
     return ImportPlan(gate_sets, strategies, matched, unmatched, names, scopes)

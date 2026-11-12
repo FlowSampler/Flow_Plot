@@ -42,6 +42,7 @@ from gating import (
     add_child_node,
     apply_named_gate_set,
     delete_gate_tree,
+    dependent_overrides,
     list_gate_set_names,
     list_saved_strategies,
     load_all_gate_sets,
@@ -4365,7 +4366,30 @@ class GatingApp(ttk.Frame):
             scope["filename"] = os.path.basename(self.current_path)
 
         gate_set = GateSet(name=name, scope=scope, steps=steps)
+        # populations saved on top of the general variant of this gate (e.g. 'CD19+'
+        # below 'Lymphocytes') must follow a file/group-specific re-definition too
+        dependents = []
+        if scope_type != "all":
+            probe = os.path.basename(self.current_path)
+            if scope_type == "group":
+                probe = next((os.path.basename(p) for p in self.fcs_paths if gate_set.matches(os.path.basename(p))),
+                             probe)
+            dependents = dependent_overrides(self.existing_gate_sets, gate_set, probe)
         out_path = save_gate_set(gate_set, self.gates_dir)
+        note = ""
+        if dependents:
+            where = f"Datei '{scope.get('filename')}'" if scope_type == "file" else f"Gruppe '{scope.get('pattern')}'"
+            listing = ", ".join(d.name for d in dependents[:8]) + (" …" if len(dependents) > 8 else "")
+            if messagebox.askyesno(
+                "Abhängige Populationen anpassen?",
+                f"{len(dependents)} gespeicherte Population(en) liegen unter '{name}' und verwenden für {where} noch "
+                f"das bisherige '{name}'-Gate:\n{listing}\n\n"
+                f"Für {where} ebenfalls auf das neue '{name}'-Gate umstellen? (empfohlen — sonst rechnen diese "
+                "Populationen hier weiter mit dem alten Eltern-Gate)",
+            ):
+                for d in dependents:
+                    save_gate_set(d, self.gates_dir)
+                note = f"\n\n{len(dependents)} abhängige Population(en) für {where} mit angepasst."
 
         self.existing_gate_sets = load_all_gate_sets(self.gates_dir)
         self._refresh_existing_listbox()
@@ -4373,6 +4397,7 @@ class GatingApp(ttk.Frame):
             "Gespeichert",
             f"Gate-Set '{name}' gespeichert unter:\n{out_path}\n\n"
             f"({len(steps)} Schritt(e) auf dem Pfad Wurzel → '{self.gate_tree[self.current_node_id].name}')"
+            f"{note}"
         )
 
     # ---------------------------------------------------------- kinetics tab

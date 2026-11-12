@@ -35,10 +35,14 @@ scope.type is one of:
   - "group": applies to every filename containing scope.pattern (case-insensitive substring)
   - "file":  applies only to the exact filename in scope.filename
 
-When several gate-sets match a given file, all of them are combined with a
-logical AND (each gate-set's steps are themselves ANDed in sequence). This
-lets you stack a broad "all files" debris/singlet gate with a more specific
-group- or file-level refinement gate.
+Several gate-sets may share a NAME with different scopes — these are
+variants of the same population, and for each file exactly ONE of them is
+used, the most specific one: file > group > all (among several matching
+groups the longest pattern wins, so 'AP-2' beats 'AP'). A file with its own
+"file" gate therefore uses only that gate, never an intersection with the
+"all" gate. Gate-sets with DIFFERENT names are stacked with a logical AND
+(each gate-set's steps are themselves ANDed in sequence), e.g. a broad
+"all files" singlet gate plus a group-specific debris gate.
 """
 from __future__ import annotations
 
@@ -196,40 +200,90 @@ def safe_file_stem(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
 
 
+def gate_set_file_stem(gate_set: GateSet) -> str:
+    """One JSON file per (name, scope): 'Lymphocytes', 'Lymphocytes__grp_AP-2',
+    'Lymphocytes__AP-2_CD18 - PE' — so a file/group variant never overwrites
+    the 'all' variant of the same population."""
+    scope = gate_set.scope
+    if scope.get("type") == "group":
+        suffix = "grp_" + scope.get("pattern", "")
+    elif scope.get("type") == "file":
+        suffix = os.path.splitext(os.path.basename(scope.get("filename", "")))[0]
+    else:
+        suffix = ""
+    stem = safe_file_stem(gate_set.name) + (f"__{safe_file_stem(suffix)}" if suffix else "")
+    if len(stem) > 120:  # keep full paths below the Windows limit
+        import hashlib
+        stem = stem[:100] + "_" + hashlib.md5(stem.encode()).hexdigest()[:10]
+    return stem
+
+
+def _same_scope(a: dict, b: dict) -> bool:
+    if a.get("type") != b.get("type"):
+        return False
+    if a.get("type") == "group":
+        return a.get("pattern", "").lower() == b.get("pattern", "").lower()
+    if a.get("type") == "file":
+        return os.path.basename(a.get("filename", "")) == os.path.basename(b.get("filename", ""))
+    return True
+
+
 def save_gate_set(gate_set: GateSet, gates_dir: str, file_stem: str | None = None) -> str:
-    """file_stem: explicit file name (without .json) — needed when several
-    scope variants of the same name are saved side by side (e.g. one per
-    file), which would otherwise overwrite each other."""
+    """Write the gate-set to '<gates_dir>/<stem>.json'. Any OTHER file holding
+    the same name with the same scope (e.g. saved by an older version under a
+    different file name) is removed, so there is never more than one variant
+    per (name, scope)."""
     os.makedirs(gates_dir, exist_ok=True)
     payload = {
         "name": gate_set.name,
         "scope": gate_set.scope,
         "steps": [_step_to_dict(s) for s in gate_set.steps],
     }
-    out_path = os.path.join(gates_dir, f"{file_stem or safe_file_stem(gate_set.name)}.json")
+    out_path = os.path.join(gates_dir, f"{file_stem or gate_set_file_stem(gate_set)}.json")
+    for f in os.listdir(gates_dir):
+        p = os.path.join(gates_dir, f)
+        if not f.lower().endswith(".json") or os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(out_path)):
+            continue
+        try:
+            other = load_gate_set(p)
+        except (OSError, ValueError, KeyError):
+            continue
+        if other.name == gate_set.name and _same_scope(other.scope, gate_set.scope):
+            os.remove(p)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     return out_path
 
 
+def _specificity(gs: GateSet) -> tuple[int, int]:
+    """Sort key: scope priority (file > group > all), then group-pattern length."""
+    pattern_len = len(gs.scope.get("pattern", "")) if gs.scope.get("type") == "group" else 0
+    return gs.priority(), pattern_len
+
+
 def resolve_gate_sets_for_file(filename: str, gate_sets: list[GateSet]) -> list[GateSet]:
-    matching = [gs for gs in gate_sets if gs.matches(filename)]
-    matching.sort(key=lambda gs: gs.priority())
-    return matching
+    """The gate-sets that apply to `filename`: per NAME only the most
+    specific matching variant (file > group > all, then longest group
+    pattern; on a full tie the first one loaded), in first-seen name order."""
+    best: dict[str, GateSet] = {}
+    for gs in gate_sets:
+        if not gs.matches(filename):
+            continue
+        current = best.get(gs.name)
+        if current is None or _specificity(gs) > _specificity(current):
+            best[gs.name] = gs
+    return list(best.values())
 
 
 def apply_gates(df: pd.DataFrame, filename: str, gate_sets: list[GateSet]) -> tuple[np.ndarray, list[str]]:
     """Return (boolean mask, list of applied gate-set names) for the given file.
 
-    NOTE: this ANDs together every gate-set whose scope matches the file. That
-    is correct for STACKED refinement gates (e.g. an "all files" singlet gate
-    plus a "ZCL278" group-specific debris gate), but wrong if you have several
-    mutually exclusive named populations (e.g. "Lebend" and "Dead") saved with
-    overlapping scope — ANDing those together gives their intersection, not a
-    choice between them. Use apply_named_gate_set() when you want exactly one
-    named population (its file/group/all scope variants are still resolved
-    with the usual priority, so a per-file override under the same name still
-    works as expected).
+    Per name only the most specific variant is used (see
+    resolve_gate_sets_for_file); DIFFERENT names are ANDed. That is right for
+    STACKED refinement gates (e.g. an "all files" singlet gate plus a "ZCL278"
+    group-specific debris gate), but not for several mutually exclusive
+    populations (e.g. "Lebend" and "Dead") — their AND is (nearly) empty. Use
+    apply_named_gate_set() to pick exactly one named population.
     """
     applicable = resolve_gate_sets_for_file(filename, gate_sets)
     mask = np.ones(len(df), dtype=bool)
@@ -247,11 +301,36 @@ def list_gate_set_names(gate_sets: list[GateSet]) -> list[str]:
     return seen
 
 
+def dependent_overrides(gate_sets: list[GateSet], override: GateSet, filename: str) -> list[GateSet]:
+    """Gate-sets built ON TOP of the population that `override` re-defines.
+
+    Every gate-set stores its full root -> population path. When e.g.
+    'Lymphocytes' gets its own variant for one file, 'CD19+' (whose path
+    starts with the general Lymphocytes gate) would otherwise keep using the
+    old Lymphocytes gate for that file. For each such dependent population
+    this returns a new variant with the override's scope whose path is the
+    override's steps + the dependent's remaining steps. `filename` is a file
+    the override applies to (used to resolve which variants are in effect)."""
+    others = [gs for gs in gate_sets if not (gs.name == override.name and _same_scope(gs.scope, override.scope))]
+    general = next((gs for gs in resolve_gate_sets_for_file(filename, others) if gs.name == override.name), None)
+    if general is None:
+        return []
+    prefix = [_step_to_dict(s) for s in general.steps]
+    new_prefix = [_step_to_dict(s) for s in override.steps]
+    if prefix == new_prefix:
+        return []
+    out = []
+    for gs in resolve_gate_sets_for_file(filename, others):
+        if gs.name == override.name or len(gs.steps) <= len(prefix):
+            continue
+        if [_step_to_dict(s) for s in gs.steps[:len(prefix)]] == prefix:
+            out.append(GateSet(gs.name, dict(override.scope), list(override.steps) + list(gs.steps[len(prefix):])))
+    return out
+
+
 def apply_named_gate_set(df: pd.DataFrame, filename: str, gate_sets: list[GateSet], name: str) -> tuple[np.ndarray, list[str]]:
-    """Apply only the gate-set(s) called `name` (its file/group/all scope
-    variants are resolved with the usual file > group > all priority) — use
-    this to pick exactly one named population instead of ANDing everything
-    that happens to match the file's scope."""
+    """Apply only the gate-set called `name` — for this file the single most
+    specific variant of it (file > group > all)."""
     named = [gs for gs in gate_sets if gs.name == name]
     return apply_gates(df, filename, named)
 

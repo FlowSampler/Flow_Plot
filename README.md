@@ -206,8 +206,7 @@ Dropdowns oben, direkt am Plot.
 - **Bereichs-Gate (1D)**: entsteht beim FlowJo-Import (z.B. `Comp-PE-A+`), wird als zwei
   senkrechte Linien angezeigt, sobald der X-Kanal passt
 
-**Scope-Optionen** (beliebig viele Gate-Sets können kombiniert werden, sie werden pro Datei
-per UND verknüpft):
+**Scope-Optionen:**
 
 | Scope | Wirkung | Beispiel |
 |---|---|---|
@@ -215,15 +214,31 @@ per UND verknüpft):
 | `group` + Pattern `ZCL278` | gilt für alle Dateien, deren Name `ZCL278` enthält | bedingungsspezifisches Gate |
 | `file` | gilt nur für die aktuell ausgewählte Datei | Ausreißer-Datei manuell nachjustieren |
 
+**Welches Gate gilt für eine Datei?** Gate-Sets mit gleichem Namen sind Varianten derselben
+Population. Pro Datei wird davon **genau eine** verwendet, die spezifischste:
+`file` vor `group` vor `all` (bei mehreren passenden Gruppen das längere Pattern). Eine Datei
+mit eigenem `file`-Gate rechnet also nur mit diesem — nie mit einer Mischung aus `all`- und
+`file`-Gate; alle anderen Dateien behalten das `all`-Gate. Das gilt einheitlich für Statistik,
+Kinetik, Overlay und Panel-Export (Blatt "Gates" im Excel-Export zeigt je Datei die verwendete
+Variante). Gate-Sets mit **verschiedenen** Namen werden dagegen per UND gestapelt (z.B. ein
+allgemeines Singlet-Gate plus ein gruppenspezifisches Debris-Gate).
+
+Jede Variante liegt in einer eigenen Datei (`Name.json`, `Name__grp_<Pattern>.json`,
+`Name__<Dateiname>.json`). Wird eine Population für eine Datei/Gruppe neu gespeichert, bietet
+die GUI an, die **darunterliegenden Populationen** (z.B. `CD19+` unter `Lymphocytes`) für diese
+Datei/Gruppe mitzuziehen — sonst würden sie dort weiter mit dem alten Eltern-Gate rechnen.
+
 ### FlowJo-Workspace importieren
 
 Links **"FlowJo-Workspace (.wsp) importieren..."**: liest einen FlowJo-Workspace und übernimmt
 nach einer Übersicht (Proben, Populationen, Kompensation) wahlweise:
 
 - **Gate-Sets** — jede Population wird ein Gate-Set (Name wie in FlowJo; kommt ein Name unter
-  mehreren Eltern vor, mit Eltern-Präfix, z.B. `CD3+CD56+/Comp-APC-A+`). Gleiche Gates in allen
-  Proben → Scope `all`; je FlowJo-Gruppe gleich und Gruppenname im Dateinamen → `group`; sonst
-  eine `file`-Variante pro Probe
+  mehreren Eltern vor, mit Eltern-Präfix, z.B. `CD3+CD56+/Comp-APC-A+`). Die häufigste
+  Gate-Definition → Scope `all`; Proben mit individuell angepasstem Gate (oder angepasstem
+  Gate darüber) → eigene `file`-Variante, bzw. `group`, wenn genau eine FlowJo-Gruppe gleich
+  abweicht und ihr Name im Dateinamen steht. Fehlt eine Population in manchen Proben, gibt es
+  kein `all`, nur `group`/`file`
 - **Gate-Hierarchie** als Gating-Strategie (bei unterschiedlichen Bäumen eine pro Gruppe), die
   direkt im Gating-Tab geöffnet wird
 - **Kompensation** — die in FlowJo verwendete (ggf. dort bearbeitete) Matrix als
