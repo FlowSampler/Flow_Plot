@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -97,6 +98,15 @@ class GateStep:
             mask &= (s_y >= 0) if p["y_sign"] == "+" else (s_y < 0)
             return mask
         raise ValueError(f"Unknown gate shape: {self.shape!r}")
+
+    def channels(self) -> set[str]:
+        """All data columns this step reads (incl. nested boolean terms)."""
+        if self.shape == "boolean":
+            return {ch for t in (self.params or {}).get("terms", []) for s in t.get("steps", [])
+                    for ch in step_from_dict(s).channels()}
+        if self.shape == "range":
+            return {self.x_channel}
+        return {self.x_channel, self.y_channel}
 
     @property
     def is_boolean(self) -> bool:
@@ -172,6 +182,12 @@ class GateSet:
     def priority(self) -> int:
         return {"all": 1, "group": 2, "file": 3}[self.scope.get("type")]
 
+    def missing_channels(self, columns) -> list[str]:
+        """Channels the gate needs that are not in ``columns`` (e.g. a 7-AAD
+        gate applied to a file measured without 7-AAD)."""
+        cols = set(columns)
+        return sorted({ch for s in self.steps for ch in s.channels()} - cols)
+
     def mask(self, df: pd.DataFrame) -> np.ndarray:
         combined = np.ones(len(df), dtype=bool)
         for step in self.steps:
@@ -192,7 +208,11 @@ def load_all_gate_sets(gates_dir: str) -> list[GateSet]:
     gate_sets = []
     for f in sorted(os.listdir(gates_dir)):
         if f.lower().endswith(".json"):
-            gate_sets.append(load_gate_set(os.path.join(gates_dir, f)))
+            try:
+                gate_sets.append(load_gate_set(os.path.join(gates_dir, f)))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                # a broken/foreign .json must not keep the whole app from starting
+                print(f"Gate-Set übersprungen ({f}): {exc}", file=sys.stderr)
     return gate_sets
 
 
@@ -287,9 +307,18 @@ def apply_gates(df: pd.DataFrame, filename: str, gate_sets: list[GateSet]) -> tu
     """
     applicable = resolve_gate_sets_for_file(filename, gate_sets)
     mask = np.ones(len(df), dtype=bool)
+    applied = []
     for gs in applicable:
+        missing = gs.missing_channels(df.columns)
+        if missing:
+            # the population is undefined in this file (e.g. 7-AAD gate, file without
+            # 7-AAD): count it as empty rather than crash or silently use all events
+            mask &= False
+            applied.append(f"{gs.name} (Kanal fehlt: {', '.join(missing)})")
+            continue
         mask &= gs.mask(df)
-    return mask, [gs.name for gs in applicable]
+        applied.append(gs.name)
+    return mask, applied
 
 
 def list_gate_set_names(gate_sets: list[GateSet]) -> list[str]:

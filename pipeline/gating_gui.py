@@ -3241,8 +3241,19 @@ class GatingApp(ttk.Frame):
             return np.ones(len(df), dtype=bool)
         applicable = resolve_gate_sets_for_file(filename, self.existing_gate_sets)
         mask = np.ones(len(df), dtype=bool)
+        skipped = []
         for gs in applicable:
+            missing = gs.missing_channels(df.columns)
+            if missing:
+                # e.g. a group gate whose pattern accidentally matches a file of another
+                # panel — skip it in the preview instead of crashing on a KeyError
+                skipped.append(f"{gs.name} (fehlt: {', '.join(missing)})")
+                continue
             mask &= gs.mask(df)
+        if skipped:
+            self.status_var.set(
+                f"{filename}: Gate-Set(s) übersprungen, Kanal nicht in der Datei: {'; '.join(skipped)}"
+            )
         return mask
 
     def _cumulative_pending_mask(self, df) -> np.ndarray:
