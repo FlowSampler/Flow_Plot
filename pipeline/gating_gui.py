@@ -83,7 +83,7 @@ from compensation import (
     save_matrix,
 )
 from io_utils import FcsData, find_fcs_files, load_fcs
-from wsp_import import compare_counts, plan_import, read_workspace
+from wsp_import import compare_counts, count_matching, locate_data_folder, plan_import, read_workspace
 from kinetics import (
     KIN_DISPLAY_MEDIAN,
     KIN_DISPLAY_RIDGE,
@@ -2696,6 +2696,33 @@ class GatingApp(ttk.Frame):
         self.update_idletasks()
         try:
             ws = read_workspace(path)
+        except Exception as exc:
+            self.config(cursor="")
+            messagebox.showerror("Import fehlgeschlagen", f"Der Workspace konnte nicht gelesen werden:\n{exc}")
+            self.status_var.set("Workspace-Import fehlgeschlagen.")
+            return
+
+        # open the experiment folder holding the workspace's .fcs files, unless
+        # the current one already has them
+        folder_note = ""
+        current = {os.path.basename(p) for p in self.fcs_paths}
+        if not any(s in current for s in ws.samples):
+            self.status_var.set("Suche die .fcs-Dateien des Workspaces ...")
+            self.update_idletasks()
+            search = locate_data_folder(ws)
+            self.config(cursor="")
+            folder = search.folder or self._ask_wsp_data_folder(ws, search)
+            if not folder:
+                self.status_var.set("Workspace-Import abgebrochen.")
+                return
+            if not self._confirm_discard_current_strategy() or not self._load_experiment(folder):
+                self.status_var.set("Workspace-Import abgebrochen.")
+                return
+            how = search.how if search.folder else "manuell gewählt"
+            folder_note = f"Experiment-Ordner automatisch geöffnet ({how}): {folder}"
+            self.config(cursor="watch")
+
+        try:
             plan = plan_import(ws, [os.path.basename(p) for p in self.fcs_paths])
         except Exception as exc:
             messagebox.showerror("Import fehlgeschlagen", f"Der Workspace konnte nicht gelesen werden:\n{exc}")
@@ -2703,9 +2730,66 @@ class GatingApp(ttk.Frame):
             return
         finally:
             self.config(cursor="")
-        self._show_wsp_import_dialog(ws, plan)
+        self._show_wsp_import_dialog(ws, plan, folder_note)
 
-    def _show_wsp_import_dialog(self, ws, plan):
+    def _ask_wsp_data_folder(self, ws, search) -> str | None:
+        """The .fcs files were neither at the stored path nor next to the .wsp:
+        explain why and let the user pick the folder. Returns None on cancel."""
+        win = tk.Toplevel(self)
+        win.title(".fcs-Dateien nicht gefunden")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        n = len(ws.samples)
+        stored = search.stored_folder
+        if stored and not os.path.isdir(stored):
+            reason = (f"Der im Workspace hinterlegte Ordner existiert auf diesem Rechner nicht:\n    {stored}\n"
+                      "(z. B. Workspace von einem anderen PC, Daten verschoben/umbenannt oder Netzlaufwerk "
+                      "nicht verbunden.)")
+        elif stored:
+            reason = (f"Der im Workspace hinterlegte Ordner existiert, enthält aber keine der Proben:\n    {stored}\n"
+                      "(z. B. Dateien verschoben oder umbenannt.)")
+        else:
+            reason = "Der Workspace enthält keinen Speicherort für die .fcs-Dateien."
+        text = (
+            f"Die .fcs-Dateien zum Workspace '{os.path.basename(ws.path)}' ({n} Probe(n)) wurden nicht gefunden.\n\n"
+            f"{reason}\n\n"
+            f"Auch im Ordner der .wsp-Datei liegen keine passenden Dateien:\n"
+            f"    {os.path.dirname(os.path.abspath(ws.path))}\n\n"
+            "Bitte den Ordner mit den .fcs-Dateien manuell wählen (Unterordner werden mit durchsucht). "
+            "Zugeordnet wird über den Dateinamen — die Dateien dürfen seit dem FlowJo-Export nicht umbenannt "
+            "worden sein."
+        )
+        ttk.Label(win, text=text, justify="left", wraplength=620).pack(anchor="w", padx=12, pady=(12, 6))
+        error_var = tk.StringVar()
+        ttk.Label(win, textvariable=error_var, foreground="#a33", justify="left", wraplength=620).pack(
+            anchor="w", padx=12
+        )
+        result = {"folder": None}
+
+        def choose():
+            chosen = filedialog.askdirectory(
+                parent=win, title="Ordner mit den .fcs-Dateien des Workspaces wählen",
+                initialdir=self.input_dir if os.path.isdir(self.input_dir or "") else os.getcwd(),
+            )
+            if not chosen:
+                return
+            found = count_matching(ws, chosen)
+            if not found:
+                error_var.set(f"Im gewählten Ordner '{chosen}' liegt keine der {n} Proben des Workspaces. "
+                              "Bitte einen anderen Ordner wählen.")
+                return
+            result["folder"] = chosen
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(anchor="e", padx=12, pady=12)
+        ttk.Button(btns, text="Ordner wählen...", command=choose).pack(side="left", padx=4)
+        ttk.Button(btns, text="Abbrechen", command=win.destroy).pack(side="left")
+        win.wait_window()
+        return result["folder"]
+
+    def _show_wsp_import_dialog(self, ws, plan, folder_note: str = ""):
         win = tk.Toplevel(self)
         win.title("FlowJo-Workspace importieren")
         win.transient(self.winfo_toplevel())
@@ -2724,6 +2808,8 @@ class GatingApp(ttk.Frame):
             f"Gating-Strategie(n): {', '.join(n for n, _ in plan.strategies)}",
             f"Kompensation: {ws.comp_note}",
         ]
+        if folder_note:
+            lines.insert(1, folder_note)
         if not plan.matched:
             lines.append("ACHTUNG: keine Probe passt zu einer .fcs-Datei im aktuellen Experiment-Ordner.")
         ttk.Label(win, text="\n".join(lines), justify="left", wraplength=640).pack(anchor="w", padx=10, pady=(10, 6))
@@ -2890,7 +2976,7 @@ class GatingApp(ttk.Frame):
             f"Dateiliste aktualisiert: {len(added)} neu, {len(removed)} entfernt, {len(self.fcs_paths)} gesamt."
         )
 
-    def _load_experiment(self, root_dir: str):
+    def _load_experiment(self, root_dir: str) -> bool:
         """Point the whole app at a new experiment folder: .fcs files are
         picked up recursively from it, gate-sets are read from/saved to its
         'gates' subfolder, and exports default into its 'exports' subfolder —
@@ -2899,7 +2985,7 @@ class GatingApp(ttk.Frame):
             fcs_paths = find_fcs_files(root_dir, recursive=True)
         except FileNotFoundError as exc:
             messagebox.showerror("Keine FCS-Dateien gefunden", str(exc))
-            return
+            return False
 
         self._cancel_drawing()
         self.input_dir = root_dir
@@ -2939,6 +3025,7 @@ class GatingApp(ttk.Frame):
             f"Experiment geladen: {len(self.fcs_paths)} FCS-Datei(en) aus '{root_dir}'. "
             f"Gates: '{self.gates_dir}', Exporte: '{self.exports_dir}', Strategien: '{self.strategies_dir}'."
         )
+        return True
 
     # ---------------------------------------------------------- data access
     def _get_data(self, path: str):

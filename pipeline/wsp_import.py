@@ -60,6 +60,7 @@ class WspWorkspace:
     comp: CompMatrix | None
     comp_note: str
     warnings: list = field(default_factory=list)
+    sample_paths: dict = field(default_factory=dict)  # sample name -> .fcs path FlowJo stored (may not exist here)
 
 
 # ------------------------------------------------------------------ geometry
@@ -186,10 +187,14 @@ def read_workspace(wsp_path: str) -> WspWorkspace:
         warnings.append(f"FlowJo-Zählungen nicht lesbar: {exc}")
 
     samples: dict[str, WspSample] = {}
+    sample_paths: dict[str, str] = {}
     comps = []
     for sid, sdict in parsed["samples"].items():
         uri = sdict.get("sample_uri") or ""
         name = sid if sid.lower().endswith(".fcs") or not uri else os.path.basename(uri.replace("\\", "/"))
+        stored = _uri_to_path(uri, os.path.dirname(os.path.abspath(wsp_path)))
+        if stored:
+            sample_paths[name] = stored
         strategy = sdict["gating_strategy"]
         ws = WspSample(name=name, flowjo_counts=counts.get(sid, {}))
         pending = list(strategy.get_gate_ids())
@@ -246,7 +251,74 @@ def read_workspace(wsp_path: str) -> WspWorkspace:
             warnings.append("Proben verwenden unterschiedliche Kompensationsmatrizen — übernommen wird die häufigste.")
 
     groups = {g: [_sample_name(parsed, s) for s in v.get("samples", [])] for g, v in parsed.get("groups", {}).items()}
-    return WspWorkspace(wsp_path, samples, groups, comp_matrix, comp_note, warnings)
+    return WspWorkspace(wsp_path, samples, groups, comp_matrix, comp_note, warnings, sample_paths)
+
+
+def _uri_to_path(uri: str, wsp_dir: str) -> str | None:
+    """Local file path from FlowJo's sample URI ('file:/C:/Data/a%20b.fcs',
+    'file:///Users/x/a.fcs', a plain path, or one relative to the workspace)."""
+    from urllib.parse import unquote, urlparse
+
+    if not uri:
+        return None
+    if uri.lower().startswith("file:"):
+        parsed = urlparse(uri)
+        path = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            path = f"//{parsed.netloc}{path}"  # network share: file://server/share/...
+        elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]  # '/C:/...' -> 'C:/...'
+    else:
+        path = unquote(uri)
+    if not os.path.isabs(path):
+        path = os.path.join(wsp_dir, path)
+    return os.path.normpath(path)
+
+
+@dataclass
+class DataFolderSearch:
+    folder: str | None  # experiment folder to open, None if nothing was found
+    how: str  # human-readable: where the folder came from / why nothing was found
+    found: int  # samples with an .fcs file in that folder
+    stored_folder: str | None  # common folder of the paths FlowJo stored
+
+
+def count_matching(ws: WspWorkspace, folder: str) -> int:
+    from io_utils import find_fcs_files
+
+    try:
+        names = {os.path.basename(p) for p in find_fcs_files(folder, recursive=True)}
+    except (FileNotFoundError, OSError):
+        return 0
+    return sum(1 for s in ws.samples if s in names)
+
+
+def locate_data_folder(ws: WspWorkspace) -> DataFolderSearch:
+    """Find the folder holding the workspace's .fcs files: first the paths
+    FlowJo stored in the .wsp, then the folder the .wsp itself lies in."""
+    stored_dirs = [os.path.dirname(p) for p in ws.sample_paths.values()]
+    stored_folder = None
+    if stored_dirs:
+        try:
+            stored_folder = os.path.commonpath(stored_dirs)
+        except ValueError:  # different drives
+            stored_folder = stored_dirs[0]
+
+    existing = [os.path.dirname(p) for p in ws.sample_paths.values() if os.path.isfile(p)]
+    if existing:
+        try:
+            folder = os.path.commonpath(existing)
+        except ValueError:
+            folder = collections.Counter(existing).most_common(1)[0][0]
+        n = count_matching(ws, folder)
+        if n:
+            return DataFolderSearch(folder, "im Workspace hinterlegter Pfad", n, stored_folder)
+
+    wsp_dir = os.path.dirname(os.path.abspath(ws.path))
+    n = count_matching(ws, wsp_dir)
+    if n:
+        return DataFolderSearch(wsp_dir, "Ordner der .wsp-Datei", n, stored_folder)
+    return DataFolderSearch(None, "nicht gefunden", 0, stored_folder)
 
 
 def _sample_name(parsed, sid):
