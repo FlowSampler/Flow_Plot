@@ -98,6 +98,8 @@ class OverlaySeries:
     values: np.ndarray  # raw, finite values of the population
     color: str
     n_gated: int = 0
+    linestyle: object = "-"  # matplotlib linestyle ('-', '--', ':', '-.' or a dash tuple)
+    linewidth: float = 1.4
 
 
 @dataclass
@@ -186,12 +188,12 @@ def _short(label: str, n: int = 38) -> str:
     return label if len(label) <= n else "…" + label[-(n - 1):]
 
 
-def _draw_curve(ax, x, y, base, color, fill, alpha, zorder, occlude, label=None, linewidth=1.4):
+def _draw_curve(ax, x, y, base, color, fill, alpha, zorder, occlude, label=None, linewidth=1.4, linestyle="-"):
     if fill:
         if occlude:  # opaque underlay so curves in front hide the ones behind
             ax.fill_between(x, base, base + y, color=ax.get_facecolor(), zorder=zorder, linewidth=0)
         ax.fill_between(x, base, base + y, color=color, alpha=alpha, zorder=zorder, linewidth=0)
-    ax.plot(x, base + y, color=color, linewidth=linewidth, zorder=zorder + 0.5, label=label)
+    ax.plot(x, base + y, color=color, linewidth=linewidth, linestyle=linestyle, zorder=zorder + 0.5, label=label)
 
 
 def draw_ridgeline(ax, x, curves, labels, colors, offset_frac=0.6, fill=True, alpha=0.8,
@@ -265,7 +267,7 @@ def draw_overlay(
         axes = fig.subplots(n, 1, sharex=True, sharey=True, squeeze=False)[:, 0]
         for ax, s, y in zip(axes, series, curves):
             tr.apply_to(ax)
-            _draw_curve(ax, x, y, 0.0, s.color, fill, alpha, 2, False)
+            _draw_curve(ax, x, y, 0.0, s.color, fill, alpha, 2, False, linewidth=s.linewidth, linestyle=s.linestyle)
             ax.text(0.01, 0.92, _legend_label(s, legend_stats), transform=ax.transAxes,
                     ha="left", va="top", fontsize=8, color=s.color, fontweight="bold")
             ax.set_ylim(0, y_max * 1.08)
@@ -282,7 +284,8 @@ def draw_overlay(
 
     if mode == "Overlay":
         for i, (s, y) in enumerate(zip(series, curves)):
-            _draw_curve(ax, x, y, 0.0, s.color, fill, alpha, 2 + i, False, label=_legend_label(s, legend_stats))
+            _draw_curve(ax, x, y, 0.0, s.color, fill, alpha, 2 + i, False, label=_legend_label(s, legend_stats),
+                        linewidth=s.linewidth, linestyle=s.linestyle)
         ax.set_ylim(0, y_max * 1.05)
         ax.set_xlim(lo_raw, hi_raw)
         ax.set_ylabel(result.y_label)
@@ -296,7 +299,8 @@ def draw_overlay(
             xi = tr.inverse(t_x + i * dx_t) if dx_t else x
             ax.plot([xi[0], xi[-1]], [bases[i], bases[i]], color=s.color, linewidth=0.6,
                     alpha=0.6, zorder=2 + 2 * (n - i))
-            _draw_curve(ax, xi, y, bases[i], s.color, fill, alpha, 2 + 2 * (n - i), True)
+            _draw_curve(ax, xi, y, bases[i], s.color, fill, alpha, 2 + 2 * (n - i), True,
+                        linewidth=s.linewidth, linestyle=s.linestyle)
         hi_t = tr.forward([hi_raw])[0] + (n - 1) * dx_t
         ax.set_xlim(lo_raw, float(tr.inverse([hi_t])[0]))
         ax.set_ylim(0, bases[-1] + y_max * 1.08)

@@ -150,6 +150,17 @@ COMP_MATRIX_FILE = "matrix.json"
 COMP_SETTINGS_FILE = "settings.json"
 EXCLUDED_FILES_FILE = "excluded_files.json"  # in the experiment folder: files hidden from the list
 
+# Overlay line styles: label -> (matplotlib linestyle, short marker shown in the file list)
+OVERLAY_LINESTYLES = {
+    "Durchgezogen": ("-", ""),
+    "Gestrichelt": ("--", "– –"),
+    "Gepunktet": (":", "···"),
+    "Strich-Punkt": ("-.", "–·"),
+    "Strich-Punkt-Punkt": ((0, (6, 2, 1, 2, 1, 2)), "–··"),
+    "Lang gestrichelt": ((0, (10, 4)), "— —"),
+}
+DEFAULT_LINESTYLE = "Durchgezogen"
+
 
 class GatingApp(ttk.Frame):
     def __init__(self, master, input_dir: str, gates_dir: str):
@@ -188,6 +199,7 @@ class GatingApp(ttk.Frame):
         self._kin_last_events = None  # (time_s, value) arrays of the last drawn kinetic
         self.kin_point_color = "#1f4e8c"
         self.ov_colors: dict[str, str] = {}  # per-file color overrides for the overlay tab (path -> hex)
+        self.ov_linestyles: dict[str, str] = {}  # per-file line style for the overlay tab (path -> OVERLAY_LINESTYLES key)
         self.ov_single_color = "#1f77b4"  # curve color for the "Einheitsfarbe" scheme
         self._ov_redraw_job = None
         self._ov_last_result = None
@@ -1301,7 +1313,7 @@ class GatingApp(ttk.Frame):
             controls,
             text="Overlay = übereinander · Offset = vertikal versetzt · Staggered = vertikal + horizontal versetzt · "
             "Getrennt = eigenes Panel je Datei. Die erste Datei liegt vorne/unten. \"Live\" wendet den aktuell "
-            "angezeigten Knoten des Gate-Baums auf JEDE Datei an. Farben: Doppelklick auf eine Datei (Schema "
+            "angezeigten Knoten des Gate-Baums auf JEDE Datei an. Farben/Linien: Dateien markieren und unter 'Stil der markierten Dateien' setzen (Schema "
             "\"Dateifarben\"), eine Einheitsfarbe oder ein Farbverlauf von der ersten zur letzten Kurve.",
             foreground="#555", wraplength=1000,
         ).grid(row=6, column=0, columnspan=10, sticky="w", pady=(4, 0))
@@ -1313,7 +1325,8 @@ class GatingApp(ttk.Frame):
         body.add(files_frame, weight=0)
         ttk.Label(files_frame, text="Dateien im Overlay", font=("", 10, "bold")).pack(anchor="w")
         ttk.Label(
-            files_frame, text="Strg/Shift-Klick = Mehrfachauswahl\nDoppelklick = Farbe ändern",
+            files_frame,
+            text="Strg/Shift-Klick = Mehrfachauswahl\nFarbe/Linie unten gilt für alle markierten Dateien",
             foreground="#555", justify="left"
         ).pack(anchor="w")
         list_container = ttk.Frame(files_frame)
@@ -1323,8 +1336,26 @@ class GatingApp(ttk.Frame):
         self.ov_file_listbox.configure(yscrollcommand=ov_vsb.set)
         self.ov_file_listbox.pack(side="left", fill="both", expand=True)
         ov_vsb.pack(side="right", fill="y")
-        self.ov_file_listbox.bind("<<ListboxSelect>>", redraw)
+        self.ov_file_listbox.bind("<<ListboxSelect>>", self._on_overlay_files_selected)
         self.ov_file_listbox.bind("<Double-Button-1>", self._overlay_pick_color)
+
+        # Style of the MARKED files: color + line style, so curves can be
+        # told apart by more than color (e.g. same color = same condition,
+        # dashed = second parameter / timepoint).
+        style_box = ttk.LabelFrame(files_frame, text="Stil der markierten Dateien")
+        style_box.pack(fill="x", pady=(0, 4))
+        self.ov_style_color_btn = tk.Button(
+            style_box, text="Farbe…", command=self._overlay_pick_color_for_selected, relief="groove", width=8,
+        )
+        self.ov_style_color_btn.grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        ttk.Label(style_box, text="Linie:").grid(row=0, column=1, sticky="w")
+        self.ov_linestyle_var = tk.StringVar(value=DEFAULT_LINESTYLE)
+        ls_combo = ttk.Combobox(
+            style_box, textvariable=self.ov_linestyle_var, state="readonly",
+            values=list(OVERLAY_LINESTYLES), width=18,
+        )
+        ls_combo.grid(row=0, column=2, padx=4, pady=4, sticky="w")
+        ls_combo.bind("<<ComboboxSelected>>", lambda e: self._overlay_set_linestyle_for_selected())
 
         sel_btns = ttk.Frame(files_frame)
         sel_btns.pack(fill="x")
@@ -1344,7 +1375,9 @@ class GatingApp(ttk.Frame):
         self.ov_filter_var = tk.StringVar(value="")
         ttk.Entry(filter_row, textvariable=self.ov_filter_var, width=12).pack(side="left", padx=4, fill="x", expand=True)
         ttk.Button(filter_row, text="Auswählen", command=self._overlay_select_by_filter).pack(side="left")
-        ttk.Button(files_frame, text="Farben zurücksetzen", command=self._overlay_reset_colors).pack(fill="x", pady=(4, 0))
+        ttk.Button(files_frame, text="Farben & Linien zurücksetzen", command=self._overlay_reset_colors).pack(
+            fill="x", pady=(4, 0)
+        )
 
         plot_frame = ttk.Frame(body)
         body.add(plot_frame, weight=1)
@@ -1403,7 +1436,8 @@ class GatingApp(ttk.Frame):
         lb = self.ov_file_listbox
         lb.delete(0, "end")
         for i, p in enumerate(self.fcs_paths):
-            lb.insert("end", os.path.relpath(p, self.input_dir))
+            marker = OVERLAY_LINESTYLES[self._overlay_linestyle_name(p)][1]
+            lb.insert("end", os.path.relpath(p, self.input_dir) + (f"   [{marker}]" if marker else ""))
             color = self._overlay_color(p)
             lb.itemconfig(i, foreground=color, selectbackground=color, selectforeground="white")
             if p in select_paths:
@@ -1437,8 +1471,55 @@ class GatingApp(ttk.Frame):
         self._refresh_overlay_file_list(select_paths=selected)
         self._schedule_overlay_redraw()
 
+    def _overlay_linestyle_name(self, path: str) -> str:
+        name = self.ov_linestyles.get(path, DEFAULT_LINESTYLE)
+        return name if name in OVERLAY_LINESTYLES else DEFAULT_LINESTYLE
+
+    def _on_overlay_files_selected(self, _event=None):
+        """Show the style of the (first) marked file in the style box, then redraw."""
+        paths = self._overlay_selected_paths()
+        if paths:
+            self.ov_linestyle_var.set(self._overlay_linestyle_name(paths[0]))
+            color = self._overlay_color(paths[0])
+            self.ov_style_color_btn.configure(bg=color, activebackground=color, fg="white")
+        self._schedule_overlay_redraw()
+
+    def _overlay_pick_color_for_selected(self):
+        paths = self._overlay_selected_paths()
+        if not paths:
+            messagebox.showinfo("Keine Datei markiert", "Bitte zuerst eine oder mehrere Dateien in der Liste markieren.")
+            return
+        from tkinter import colorchooser
+
+        title = f"Farbe für {os.path.basename(paths[0])}" if len(paths) == 1 else f"Farbe für {len(paths)} Dateien"
+        _, hex_color = colorchooser.askcolor(color=self._overlay_color(paths[0]), title=title, parent=self)
+        if not hex_color:
+            return
+        for p in paths:
+            self.ov_colors[p] = hex_color
+        self.ov_style_color_btn.configure(bg=hex_color, activebackground=hex_color, fg="white")
+        self.ov_scheme_var.set(SCHEME_FILE)  # per-file colors only show under the per-file scheme
+        self._refresh_overlay_file_list(select_paths=set(paths))
+        self._schedule_overlay_redraw()
+
+    def _overlay_set_linestyle_for_selected(self):
+        paths = self._overlay_selected_paths()
+        if not paths:
+            messagebox.showinfo("Keine Datei markiert", "Bitte zuerst eine oder mehrere Dateien in der Liste markieren.")
+            return
+        name = self.ov_linestyle_var.get()
+        for p in paths:
+            if name == DEFAULT_LINESTYLE:
+                self.ov_linestyles.pop(p, None)
+            else:
+                self.ov_linestyles[p] = name
+        self._refresh_overlay_file_list(select_paths=set(paths))
+        self._schedule_overlay_redraw()
+
     def _overlay_reset_colors(self):
         self.ov_colors.clear()
+        self.ov_linestyles.clear()
+        self.ov_linestyle_var.set(DEFAULT_LINESTYLE)
         self.ov_scheme_var.set(SCHEME_FILE)
         self._refresh_overlay_file_list()
         self._schedule_overlay_redraw()
@@ -1511,6 +1592,7 @@ class GatingApp(ttk.Frame):
             series.append(OverlaySeries(
                 label=os.path.splitext(fcs.filename)[0], values=values,
                 color=self._overlay_color(path), n_gated=int(mask.sum()),
+                linestyle=OVERLAY_LINESTYLES[self._overlay_linestyle_name(path)][0],
             ))
             series_paths.append(path)
 
@@ -3078,6 +3160,7 @@ class GatingApp(ttk.Frame):
         self._save_excluded_files()
         for p in removed:
             self.ov_colors.pop(p, None)
+            self.ov_linestyles.pop(p, None)
         sel = self.file_listbox.curselection()
         if sel:  # select the file that moves up into the first removed slot
             self._removed_index_hint = sum(1 for p in self.fcs_paths[: sel[0]] if p in remaining)
@@ -3242,6 +3325,7 @@ class GatingApp(ttk.Frame):
         self._refresh_existing_listbox()
         self._refresh_strategy_combo()
         self.ov_colors.clear()
+        self.ov_linestyles.clear()
         self._refresh_overlay_file_list(select_paths=set())
         self._select_file_index(0)
         self.status_var.set(
