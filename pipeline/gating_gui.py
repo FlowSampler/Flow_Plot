@@ -148,6 +148,7 @@ COMP_MODES = {
 }
 COMP_MATRIX_FILE = "matrix.json"
 COMP_SETTINGS_FILE = "settings.json"
+EXCLUDED_FILES_FILE = "excluded_files.json"  # in the experiment folder: files hidden from the list
 
 
 class GatingApp(ttk.Frame):
@@ -160,8 +161,9 @@ class GatingApp(ttk.Frame):
         self.panels_dir = self._derive_sibling_dir(gates_dir, "panels")
         self.comp_dir = self._derive_sibling_dir(gates_dir, "compensation")
         self._load_comp_settings()
+        self._load_excluded_files()
         try:
-            self.fcs_paths = find_fcs_files(input_dir, recursive=True)
+            self.fcs_paths = self._filter_excluded(find_fcs_files(input_dir, recursive=True))
         except FileNotFoundError:
             self.fcs_paths = []
         self.data_cache: dict[str, FcsData] = {}
@@ -283,11 +285,21 @@ class GatingApp(ttk.Frame):
             self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
         self.file_listbox.pack(fill="both", expand=True, padx=4, pady=4)
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_selected)
+        self.file_listbox.bind("<Delete>", lambda _e: self._exclude_current_file())
 
         nav = ttk.Frame(left)
         nav.pack(fill="x", padx=4, pady=(0, 4))
         ttk.Button(nav, text="<< Prev", command=self._prev_file).pack(side="left", expand=True, fill="x")
         ttk.Button(nav, text="Next >>", command=self._next_file).pack(side="left", expand=True, fill="x")
+
+        excl = ttk.Frame(left)
+        excl.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(excl, text="Aus Liste entfernen (Entf)", command=self._exclude_current_file).pack(
+            side="left", expand=True, fill="x"
+        )
+        self.restore_excluded_button = ttk.Button(excl, command=self._restore_excluded_files)
+        self.restore_excluded_button.pack(side="left", expand=True, fill="x")
+        self._update_restore_excluded_button()
 
         ttk.Label(left, text="Existierende Gate-Sets", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(8, 0))
         self.existing_listbox = tk.Listbox(left, height=6)
@@ -2946,11 +2958,16 @@ class GatingApp(ttk.Frame):
             messagebox.showwarning("Kein Ordner geladen", "Bitte zuerst einen Experiment-Ordner wählen.")
             return
         try:
-            fcs_paths = find_fcs_files(self.input_dir, recursive=True)
+            fcs_paths = self._filter_excluded(find_fcs_files(self.input_dir, recursive=True))
         except FileNotFoundError as exc:
             messagebox.showwarning("Keine Dateien gefunden", str(exc))
             return
+        self._apply_file_list(fcs_paths)
 
+    def _apply_file_list(self, fcs_paths: list[str]):
+        """Swap in a new file list (after a rescan, hiding or restoring files)
+        while keeping the gate tree, strategy and the current file if it's
+        still in the list."""
         added = sorted(set(fcs_paths) - set(self.fcs_paths))
         removed = sorted(set(self.fcs_paths) - set(fcs_paths))
         for p in removed:
@@ -2969,12 +2986,101 @@ class GatingApp(ttk.Frame):
             self.file_listbox.see(idx)
             self.current_path = previous_selection
         elif self.fcs_paths:
-            self._select_file_index(0)
+            prev_idx = getattr(self, "_removed_index_hint", 0)
+            self._select_file_index(min(prev_idx, len(self.fcs_paths) - 1))
+        self._removed_index_hint = 0
+        if added or removed:
+            self.cohort_df = None  # cohort statistics covered the old file set
         self._refresh_overlay_file_list()
+        self._update_restore_excluded_button()
 
+        hidden = f", {len(self.excluded_files)} ausgeblendet" if self.excluded_files else ""
         self.status_var.set(
-            f"Dateiliste aktualisiert: {len(added)} neu, {len(removed)} entfernt, {len(self.fcs_paths)} gesamt."
+            f"Dateiliste aktualisiert: {len(added)} neu, {len(removed)} entfernt, "
+            f"{len(self.fcs_paths)} gesamt{hidden}."
         )
+
+    # ---------------------------------------------------------- hidden (excluded) files
+    # Files the user removed from the list. They stay on disk; only the app
+    # ignores them (file list, overlay, batch exports, statistics). Stored as
+    # paths relative to the experiment folder in '<experiment>/excluded_files.json',
+    # so the choice survives restarts and rescans.
+    def _excluded_files_path(self) -> str:
+        return os.path.join(self.input_dir, EXCLUDED_FILES_FILE)
+
+    def _load_excluded_files(self):
+        self.excluded_files: set[str] = set()
+        try:
+            with open(self._excluded_files_path(), "r", encoding="utf-8") as fh:
+                self.excluded_files = {str(p) for p in json.load(fh).get("excluded", [])}
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _save_excluded_files(self):
+        path = self._excluded_files_path()
+        try:
+            if self.excluded_files:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"excluded": sorted(self.excluded_files)}, fh, indent=2)
+            elif os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass  # read-only experiment folder: hidden only for this session
+
+    def _relpath_key(self, path: str) -> str:
+        return os.path.normcase(os.path.relpath(path, self.input_dir))
+
+    def _filter_excluded(self, paths: list[str]) -> list[str]:
+        if not self.excluded_files:
+            return paths
+        excluded = {os.path.normcase(p) for p in self.excluded_files}
+        return [p for p in paths if self._relpath_key(p) not in excluded]
+
+    def _update_restore_excluded_button(self):
+        if not hasattr(self, "restore_excluded_button"):
+            return
+        n = len(self.excluded_files)
+        self.restore_excluded_button.configure(
+            text=f"Ausgeblendete einblenden ({n})", state="normal" if n else "disabled"
+        )
+
+    def _exclude_current_file(self):
+        sel = self.file_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if len(self.fcs_paths) <= 1:
+            messagebox.showinfo("Letzte Datei", "Die letzte Datei der Liste kann nicht entfernt werden.")
+            return
+        path = self.fcs_paths[idx]
+        self._cancel_drawing()
+        self.excluded_files.add(os.path.relpath(path, self.input_dir))
+        self._save_excluded_files()
+        self.ov_colors.pop(path, None)
+        self._removed_index_hint = idx  # select the file that moves up into this slot
+        self._apply_file_list([p for p in self.fcs_paths if p != path])
+        self.status_var.set(
+            f"'{os.path.basename(path)}' aus der Liste entfernt (Datei bleibt auf der Festplatte). "
+            f"Wiederherstellen über 'Ausgeblendete einblenden'."
+        )
+
+    def _restore_excluded_files(self):
+        if not self.excluded_files:
+            return
+        names = sorted(self.excluded_files)
+        preview = "\n".join(names[:15]) + (f"\n… und {len(names) - 15} weitere" if len(names) > 15 else "")
+        if not messagebox.askyesno(
+            "Ausgeblendete Dateien einblenden", f"Diese {len(names)} Datei(en) wieder in die Liste aufnehmen?\n\n{preview}"
+        ):
+            return
+        self.excluded_files.clear()
+        self._save_excluded_files()
+        try:
+            fcs_paths = find_fcs_files(self.input_dir, recursive=True)
+        except FileNotFoundError as exc:
+            messagebox.showwarning("Keine Dateien gefunden", str(exc))
+            return
+        self._apply_file_list(fcs_paths)
 
     def _load_experiment(self, root_dir: str) -> bool:
         """Point the whole app at a new experiment folder: .fcs files are
@@ -2989,6 +3095,12 @@ class GatingApp(ttk.Frame):
 
         self._cancel_drawing()
         self.input_dir = root_dir
+        self._load_excluded_files()
+        fcs_paths = self._filter_excluded(fcs_paths)
+        if not fcs_paths:  # everything hidden: show all again rather than an empty, broken view
+            self.excluded_files.clear()
+            fcs_paths = find_fcs_files(root_dir, recursive=True)
+        self._update_restore_excluded_button()
         self.gates_dir = os.path.join(root_dir, "gates")
         self.exports_dir = os.path.join(root_dir, "exports")
         self.strategies_dir = os.path.join(root_dir, "strategies")
