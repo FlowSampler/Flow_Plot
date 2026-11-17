@@ -280,12 +280,13 @@ class GatingApp(ttk.Frame):
         self._update_comp_status()
 
         ttk.Label(left, text="FCS Dateien", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
-        self.file_listbox = tk.Listbox(left, exportselection=False)
+        # extended: Strg/Shift-Klick marks several files (to hide them at once)
+        self.file_listbox = tk.Listbox(left, selectmode="extended", exportselection=False)
         for p in self.fcs_paths:
             self.file_listbox.insert("end", os.path.relpath(p, self.input_dir))
         self.file_listbox.pack(fill="both", expand=True, padx=4, pady=4)
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_selected)
-        self.file_listbox.bind("<Delete>", lambda _e: self._exclude_current_file())
+        self.file_listbox.bind("<Delete>", lambda _e: self._exclude_selected_files())
 
         nav = ttk.Frame(left)
         nav.pack(fill="x", padx=4, pady=(0, 4))
@@ -294,11 +295,14 @@ class GatingApp(ttk.Frame):
 
         excl = ttk.Frame(left)
         excl.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Button(excl, text="Aus Liste entfernen (Entf)", command=self._exclude_current_file).pack(
+        ttk.Button(excl, text="Markierte entfernen (Entf)", command=self._exclude_selected_files).pack(
             side="left", expand=True, fill="x"
         )
-        self.restore_excluded_button = ttk.Button(excl, command=self._restore_excluded_files)
-        self.restore_excluded_button.pack(side="left", expand=True, fill="x")
+        ttk.Button(excl, text="Ordner ausblenden...", command=self._exclude_folders).pack(
+            side="left", expand=True, fill="x"
+        )
+        self.restore_excluded_button = ttk.Button(left, command=self._restore_excluded_files)
+        self.restore_excluded_button.pack(fill="x", padx=4, pady=(0, 4))
         self._update_restore_excluded_button()
 
         ttk.Label(left, text="Existierende Gate-Sets", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(8, 0))
@@ -3012,7 +3016,7 @@ class GatingApp(ttk.Frame):
         self.excluded_files: set[str] = set()
         try:
             with open(self._excluded_files_path(), "r", encoding="utf-8") as fh:
-                self.excluded_files = {str(p) for p in json.load(fh).get("excluded", [])}
+                self.excluded_files = {str(p).replace("\\", "/") for p in json.load(fh).get("excluded", [])}
         except (OSError, ValueError, AttributeError):
             pass
 
@@ -3027,60 +3031,167 @@ class GatingApp(ttk.Frame):
         except OSError:
             pass  # read-only experiment folder: hidden only for this session
 
-    def _relpath_key(self, path: str) -> str:
-        return os.path.normcase(os.path.relpath(path, self.input_dir))
+    # Entries are relative paths with '/' separators: a file ('sub/a.fcs') or
+    # a whole folder, marked by a trailing '/' ('sub/day1/'). A hidden folder
+    # also hides files copied into it later.
+    def _rel_entry(self, path: str) -> str:
+        return os.path.relpath(path, self.input_dir).replace(os.sep, "/")
+
+    def _is_excluded(self, path: str) -> bool:
+        rel = os.path.normcase(self._rel_entry(path))
+        for entry in self.excluded_files:
+            e = os.path.normcase(entry)
+            if e.endswith(("/", os.sep)):
+                if rel.startswith(e) or rel.startswith(e.rstrip("/" + os.sep) + os.sep):
+                    return True
+            elif rel == e:
+                return True
+        return False
 
     def _filter_excluded(self, paths: list[str]) -> list[str]:
         if not self.excluded_files:
             return paths
-        excluded = {os.path.normcase(p) for p in self.excluded_files}
-        return [p for p in paths if self._relpath_key(p) not in excluded]
+        return [p for p in paths if not self._is_excluded(p)]
 
     def _update_restore_excluded_button(self):
         if not hasattr(self, "restore_excluded_button"):
             return
         n = len(self.excluded_files)
         self.restore_excluded_button.configure(
-            text=f"Ausgeblendete einblenden ({n})", state="normal" if n else "disabled"
+            text=f"Ausgeblendete einblenden ({n})...", state="normal" if n else "disabled"
         )
 
-    def _exclude_current_file(self):
+    def _hide_entries(self, entries: list[str], what: str):
+        """Add file/folder entries to the hidden list and drop the matching
+        files from the visible list (refusing if nothing would be left)."""
+        new_excluded = self.excluded_files | set(entries)
+        old, self.excluded_files = self.excluded_files, new_excluded
+        remaining = self._filter_excluded(self.fcs_paths)
+        if not remaining:
+            self.excluded_files = old
+            messagebox.showinfo(
+                "Nicht möglich", "Damit wären alle Dateien ausgeblendet — mindestens eine muss in der Liste bleiben."
+            )
+            return
+        removed = [p for p in self.fcs_paths if p not in remaining]
+        self._cancel_drawing()
+        self._save_excluded_files()
+        for p in removed:
+            self.ov_colors.pop(p, None)
+        sel = self.file_listbox.curselection()
+        if sel:  # select the file that moves up into the first removed slot
+            self._removed_index_hint = sum(1 for p in self.fcs_paths[: sel[0]] if p in remaining)
+        self._apply_file_list(remaining)
+        self.status_var.set(
+            f"{what}: {len(removed)} Datei(en) aus der Liste entfernt (bleiben auf der Festplatte). "
+            f"Wiederherstellen über 'Ausgeblendete einblenden'."
+        )
+
+    def _exclude_selected_files(self):
         sel = self.file_listbox.curselection()
         if not sel:
             return
-        idx = sel[0]
-        if len(self.fcs_paths) <= 1:
-            messagebox.showinfo("Letzte Datei", "Die letzte Datei der Liste kann nicht entfernt werden.")
+        paths = [self.fcs_paths[i] for i in sel if i < len(self.fcs_paths)]
+        what = f"'{os.path.basename(paths[0])}'" if len(paths) == 1 else f"{len(paths)} markierte Dateien"
+        self._hide_entries([self._rel_entry(p) for p in paths], what)
+
+    def _exclude_folders(self):
+        """Dialog listing every subfolder that holds visible files; the
+        folder(s) of the currently marked file(s) are preselected."""
+        counts: dict[str, int] = {}
+        for p in self.fcs_paths:
+            parts = self._rel_entry(p).split("/")[:-1]
+            for depth in range(1, len(parts) + 1):
+                key = "/".join(parts[:depth]) + "/"
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            messagebox.showinfo(
+                "Keine Unterordner", "Alle Dateien liegen direkt im Experiment-Ordner — es gibt keine Unterordner."
+            )
             return
-        path = self.fcs_paths[idx]
-        self._cancel_drawing()
-        self.excluded_files.add(os.path.relpath(path, self.input_dir))
-        self._save_excluded_files()
-        self.ov_colors.pop(path, None)
-        self._removed_index_hint = idx  # select the file that moves up into this slot
-        self._apply_file_list([p for p in self.fcs_paths if p != path])
-        self.status_var.set(
-            f"'{os.path.basename(path)}' aus der Liste entfernt (Datei bleibt auf der Festplatte). "
-            f"Wiederherstellen über 'Ausgeblendete einblenden'."
+        folders = sorted(counts)
+        marked = {
+            self._rel_entry(os.path.dirname(self.fcs_paths[i])) + "/"
+            for i in self.file_listbox.curselection() if i < len(self.fcs_paths)
+        }
+        labels = [f"{'    ' * (f.count('/') - 1)}{f}   ({counts[f]} Datei(en))" for f in folders]
+        result = self._pick_items(
+            "Ordner ausblenden",
+            "Ordner wählen, deren .fcs-Dateien (inkl. Unterordner) ausgeblendet werden sollen\n"
+            "(Strg/Shift-Klick für mehrere):",
+            labels, preselect=[i for i, f in enumerate(folders) if f in marked],
+            buttons=[("hide", "Ausblenden"), ("cancel", "Abbrechen")],
         )
+        if result is None or result[0] != "hide" or not result[1]:
+            return
+        chosen = [folders[i] for i in result[1]]
+        what = f"Ordner '{chosen[0]}'" if len(chosen) == 1 else f"{len(chosen)} Ordner"
+        self._hide_entries(chosen, what)
 
     def _restore_excluded_files(self):
         if not self.excluded_files:
             return
-        names = sorted(self.excluded_files)
-        preview = "\n".join(names[:15]) + (f"\n… und {len(names) - 15} weitere" if len(names) > 15 else "")
-        if not messagebox.askyesno(
-            "Ausgeblendete Dateien einblenden", f"Diese {len(names)} Datei(en) wieder in die Liste aufnehmen?\n\n{preview}"
-        ):
+        entries = sorted(self.excluded_files, key=lambda e: (not e.endswith("/"), e.lower()))
+        labels = [f"[Ordner]  {e}" if e.endswith("/") else e for e in entries]
+        result = self._pick_items(
+            "Ausgeblendete einblenden",
+            "Ausgeblendete Dateien/Ordner — markierte wieder in die Liste aufnehmen:",
+            labels, preselect=[],
+            buttons=[("selected", "Markierte einblenden"), ("all", "Alle einblenden"), ("cancel", "Abbrechen")],
+        )
+        if result is None or result[0] == "cancel":
             return
-        self.excluded_files.clear()
+        if result[0] == "all":
+            self.excluded_files.clear()
+        else:
+            if not result[1]:
+                return
+            self.excluded_files -= {entries[i] for i in result[1]}
         self._save_excluded_files()
         try:
-            fcs_paths = find_fcs_files(self.input_dir, recursive=True)
+            fcs_paths = self._filter_excluded(find_fcs_files(self.input_dir, recursive=True))
         except FileNotFoundError as exc:
             messagebox.showwarning("Keine Dateien gefunden", str(exc))
             return
         self._apply_file_list(fcs_paths)
+
+    def _pick_items(self, title: str, prompt: str, labels: list[str], preselect: list[int],
+                    buttons: list[tuple[str, str]]) -> tuple[str, list[int]] | None:
+        """Small modal multi-select list. Returns (button key, selected
+        indices) or None if the window was closed."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self.winfo_toplevel())
+        win.geometry("560x420")
+        ttk.Label(win, text=prompt, justify="left").pack(anchor="w", padx=8, pady=(8, 4))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8)
+        lb = tk.Listbox(frame, selectmode="extended", exportselection=False)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=vsb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        for text in labels:
+            lb.insert("end", text)
+        for i in preselect:
+            lb.selection_set(i)
+        if preselect:
+            lb.see(preselect[0])
+        result: list = [None]
+
+        def finish(key):
+            result[0] = (key, list(lb.curselection()))
+            win.destroy()
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=8, pady=8)
+        for key, text in reversed(buttons):
+            ttk.Button(row, text=text, command=lambda k=key: finish(k)).pack(side="right", padx=(4, 0))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.grab_set()
+        lb.focus_set()
+        self.wait_window(win)
+        return result[0]
 
     def _load_experiment(self, root_dir: str) -> bool:
         """Point the whole app at a new experiment folder: .fcs files are
@@ -3288,6 +3399,11 @@ class GatingApp(ttk.Frame):
 
     def _on_file_selected(self, _event):
         sel = self.file_listbox.curselection()
+        if len(sel) > 1:
+            # Several files marked (Strg/Shift-Klick): keep the marking for
+            # 'Markierte entfernen' and leave the displayed file as it is.
+            self.status_var.set(f"{len(sel)} Dateien markiert — 'Markierte entfernen' (Entf) blendet sie aus.")
+            return
         if sel:
             self._cancel_drawing()
             self._select_file_index(sel[0])
