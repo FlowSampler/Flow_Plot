@@ -82,7 +82,23 @@ reines Python und sollte auch unter macOS/Linux laufen.
 ```
 Flow_Plot/
 ├── pipeline/
-│   ├── gating_gui.py         # GUI (alle Tabs)
+│   ├── gating_gui.py         # GUI-Einstieg: Hauptfenster + Start (main)
+│   ├── gui/                  # GUI-Bausteine, je ein Mixin pro Tab/Thema
+│   │   ├── constants.py      #   gemeinsame Konstanten (Plot-Typen, Farbskalen, Dateinamen)
+│   │   ├── gating_tab.py     #   Gating-Tab: Layout
+│   │   ├── gating_plot.py    #   Gating-Tab: Plot, Achsen, Gate-Umrisse
+│   │   ├── gate_tree.py      #   Gate-Baum: Navigation, Boolesche Gates, Umbenennen/Löschen
+│   │   ├── gate_drawing.py   #   neue Gates zeichnen, Gate-Sets speichern
+│   │   ├── strategies.py     #   Gating-Strategien laden/speichern
+│   │   ├── comp_tab.py       #   Kompensation-Tab
+│   │   ├── kinetics_tab.py   #   Kinetik-Tab + Exporte
+│   │   ├── stats_tab.py      #   Statistik-Tab
+│   │   ├── overlay_tab.py    #   Histogramm-Overlay-Tab
+│   │   ├── panel_tab.py      #   Panel-Export-Tab
+│   │   ├── wsp_dialog.py     #   FlowJo-Workspace-Import-Dialog
+│   │   ├── experiment.py     #   Experiment-Ordner, Dateiliste, ausgeblendete Dateien
+│   │   ├── data_access.py    #   Daten laden, aktive Kompensation, Populations-Masken
+│   │   └── common.py         #   kleine gemeinsame Helfer
 │   ├── gating.py             # Gates & Gate-Sets: Datenmodell, Laden/Speichern, Anwenden
 │   ├── compensation.py       # Spillover-Matrizen: lesen, anwenden, speichern, CSV
 │   ├── wsp_import.py         # FlowJo-Workspace (.wsp) importieren
