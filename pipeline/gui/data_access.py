@@ -11,6 +11,7 @@ import numpy as np
 
 from gating import apply_named_gate_set, list_gate_set_names, node_mask, resolve_gate_sets_for_file
 from compensation import CompMatrix, compensate, load_matrix
+from derived import apply_derived
 from io_utils import FcsData, load_fcs
 from gui.constants import GATE_SOURCE_LIVE, GATE_SOURCE_NONE, COMP_MODES, COMP_MATRIX_FILE, COMP_SETTINGS_FILE
 
@@ -35,18 +36,31 @@ class DataAccessMixin:
             raw = self._get_raw_data(path)
             matrix = self._comp_matrix_for(raw)
             if matrix is None:
-                self.data_cache[path] = raw
+                data = raw
             else:
-                self.data_cache[path] = dataclasses.replace(
-                    raw, df=compensate(raw.df, matrix), compensation=matrix.name or "Matrix"
-                )
+                data = dataclasses.replace(raw, df=compensate(raw.df, matrix), compensation=matrix.name or "Matrix")
+            # Derived parameters (formulas) are computed from the COMPENSATED
+            # values and appended as extra columns, so every tab sees them
+            # like ordinary channels.
+            params = getattr(self, "derived_params", [])
+            if params:
+                df, errors = apply_derived(data.df, params, data.marker_names)
+                data = dataclasses.replace(data, df=df)
+                if errors and path == self.current_path and hasattr(self, "status_var"):
+                    self.status_var.set(
+                        f"{data.filename}: abgeleitete(r) Parameter nicht berechnet — "
+                        + "; ".join(f"{n}: {msg}" for n, msg in errors.items())
+                    )
+            self.data_cache[path] = data
         return self.data_cache[path]
 
     def _get_raw_data(self, path: str) -> FcsData:
         """Uncompensated data. Only the last few files are kept (the
         compensated copies in data_cache are what the tabs use); with
-        compensation off both caches share the same object anyway."""
-        if path in self.data_cache and self.data_cache[path].compensation == "keine":
+        compensation off and no derived parameters both caches share the
+        same object anyway."""
+        if path in self.data_cache and self.data_cache[path].compensation == "keine" \
+                and not getattr(self, "derived_params", []):
             return self.data_cache[path]
         if path not in self._raw_cache:
             if len(self._raw_cache) >= 3:

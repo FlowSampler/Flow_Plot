@@ -276,8 +276,13 @@ class ExperimentMixin:
             return False
 
         self._cancel_drawing()
+        win = getattr(self, "_derived_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()  # its formulas belong to the previous experiment
+        self._derived_win = None
         self.input_dir = root_dir
         self._load_excluded_files()
+        self._load_derived_params()
         fcs_paths = self._filter_excluded(fcs_paths)
         if not fcs_paths:  # everything hidden: show all again rather than an empty, broken view
             self.excluded_files.clear()

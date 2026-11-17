@@ -36,6 +36,7 @@ from gui.stats_tab import StatsTabMixin
 from gui.overlay_tab import OverlayTabMixin
 from gui.panel_tab import PanelTabMixin
 from gui.wsp_dialog import WspImportMixin
+from gui.derived_dialog import DerivedParamsMixin
 from gui.experiment import ExperimentMixin
 from gui.data_access import DataAccessMixin
 from gui.common import CommonMixin
@@ -53,6 +54,7 @@ class GatingApp(
     OverlayTabMixin,
     PanelTabMixin,
     WspImportMixin,
+    DerivedParamsMixin,
     ExperimentMixin,
     DataAccessMixin,
     CommonMixin,
@@ -73,6 +75,7 @@ class GatingApp(
         self.comp_dir = self._derive_sibling_dir(gates_dir, "compensation")
         self._load_comp_settings()
         self._load_excluded_files()
+        self._load_derived_params()
         try:
             self.fcs_paths = self._filter_excluded(find_fcs_files(input_dir, recursive=True))
         except FileNotFoundError:
@@ -189,6 +192,15 @@ class GatingApp(
             anchor="w", padx=4, pady=(0, 8)
         )
         self._update_comp_status()
+
+        ttk.Label(left, text="Berechnete Kanäle", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 0))
+        self.derived_button = ttk.Button(left, command=self._open_derived_dialog)
+        self.derived_button.pack(fill="x", padx=4, pady=(2, 0))
+        self._update_derived_button()
+        ttk.Label(
+            left, text="(Formeln pro Zelle, z.B. Ratio oder GP — erscheinen als neue Kanäle in allen Tabs)",
+            foreground="#555", wraplength=250
+        ).pack(anchor="w", padx=4, pady=(0, 8))
 
         ttk.Label(left, text="FCS Dateien", font=("", 10, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
         # extended: Strg/Shift-Klick marks several files (to hide them at once)

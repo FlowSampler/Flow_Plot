@@ -79,10 +79,12 @@ class GatingPlotMixin:
         for v in (self.x_min_var, self.x_max_var, self.y_min_var, self.y_max_var):
             v.set("")
 
-    @staticmethod
-    def _default_transform_for(channel: str) -> str:
-        """Scatter (FSC/SSC) and Time are shown linear, every other channel
-        (fluorescence/'color' channels) on a log axis."""
+    def _default_transform_for(self, channel: str) -> str:
+        """Scatter (FSC/SSC), Time and derived parameters (ratios, GP, ...)
+        are shown linear, every other channel (fluorescence/'color'
+        channels) on a log axis."""
+        if self._derived_param(channel) is not None:
+            return "Linear"
         name = channel.upper()
         if "FSC" in name or "SSC" in name or "TIME" in name:
             return "Linear"
@@ -318,8 +320,35 @@ class GatingPlotMixin:
         r = (fcs.channel_ranges or {}).get(channel)
         if r:
             return r
+        derived = self._derived_axis_range(channel)
+        if derived is not None:
+            return max(abs(derived[0]), abs(derived[1]), 1e-9)
         col = fcs.df[channel]
         return float(col.max()) if len(col) else 262144.0
+
+    def _derived_axis_range(self, channel: str) -> tuple[float, float] | None:
+        """Axis range of a derived parameter: the one set in its definition,
+        otherwise the 0.5–99.5% percentiles of the current file (a ratio has
+        no instrument range and may be negative, so the usual 0..$PnR axis
+        doesn't fit)."""
+        param = self._derived_param(channel)
+        if param is None:
+            return None
+        lo, hi = param.axis_min, param.axis_max
+        if lo is None or hi is None:
+            col = self._get_data(self.current_path).df.get(channel)
+            vals = col.to_numpy(dtype=float) if col is not None else np.array([])
+            vals = vals[np.isfinite(vals)]
+            if len(vals):
+                p_lo, p_hi = np.percentile(vals, [0.5, 99.5])
+                pad = 0.05 * ((p_hi - p_lo) or abs(p_hi) or 1.0)
+                lo = p_lo - pad if lo is None else lo
+                hi = p_hi + pad if hi is None else hi
+            else:
+                lo, hi = (0.0 if lo is None else lo), (1.0 if hi is None else hi)
+        if hi <= lo:
+            hi = lo + 1.0
+        return float(lo), float(hi)
 
     def _scale_params(self) -> dict:
         try:
@@ -337,6 +366,9 @@ class GatingPlotMixin:
         return {"log_linthresh": linthresh, "logicle_w": logicle_w, "logicle_m": logicle_m}
 
     def _default_axis_range(self, channel: str, transform_name: str) -> tuple[float, float]:
+        derived = self._derived_axis_range(channel)
+        if derived is not None and transform_name == "Linear":
+            return derived
         return default_axis_range(transform_name, channel_range=self._channel_range(channel), **self._scale_params())
 
     def _display_transform(self, transform_name: str, channel: str) -> DisplayTransform:
