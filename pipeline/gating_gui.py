@@ -113,7 +113,7 @@ from panel_export import (
     save_panel,
     write_panel_xlsx,
 )
-from transforms import TRANSFORM_NAMES, apply_axis_scale
+from transforms import TRANSFORM_NAMES, apply_axis_scale, default_axis_range
 from version import __version__
 
 SHAPES = ["Polygon", "Rectangle", "Ellipse", "Quadrant", "Quadrant (Winkel)"]
@@ -471,7 +471,7 @@ class GatingApp(ttk.Frame):
             axis_limits_row, text="Ausreißer abschneiden (1.–99. Perzentil)", command=self._autofit_axis_limits
         ).pack(side="left", padx=(0, 4))
         ttk.Button(
-            axis_limits_row, text="Achsen-Limits zurücksetzen (Auto)", command=self._reset_axis_limits
+            axis_limits_row, text="Achsen-Limits zurücksetzen (Kanalbereich)", command=self._reset_axis_limits
         ).pack(side="left", padx=(4, 0))
 
         ttk.Label(
@@ -3351,15 +3351,24 @@ class GatingApp(ttk.Frame):
         y_out = ((y_raw < y_lo) | (y_raw > y_hi)) if y_manual else np.zeros(len(df), dtype=bool)
         out_of_range = (x_out | y_out) & view_mask
 
-        value_range = [[x_lo, x_hi] if x_manual else None, [y_lo, y_hi] if y_manual else None]
+        # No manual limits: use a FIXED per-channel range (channel range $PnR
+        # + transform) instead of matplotlib's per-file autoscaling, so the
+        # axes don't jump when clicking through files. Events outside it are
+        # simply off-screen (not clipped / not flagged as red ×).
+        if not x_manual:
+            x_lo, x_hi = self._default_axis_range(x_ch, self.x_transform_var.get())
+        if not y_manual:
+            y_lo, y_hi = self._default_axis_range(y_ch, self.y_transform_var.get())
+
+        value_range = [[x_lo, x_hi], [y_lo, y_hi]]
         is_hist = plot_type == HIST_1D
 
         self.ax.clear()
         self.ax.set_facecolor("white")
         if is_hist:
-            n_out = self._plot_histogram_1d(
-                df, view_mask, x_raw, x_ch, x_lo if x_manual else None, x_hi if x_manual else None
-            )
+            n_out = self._plot_histogram_1d(df, view_mask, x_raw, x_ch, x_lo, x_hi)
+            if not x_manual:
+                n_out = 0
         else:
             xv, yv = x_plot[view_mask], y_plot[view_mask]
             if plot_type == "Scatter":
@@ -3374,9 +3383,8 @@ class GatingApp(ttk.Frame):
             n_out = int(out_of_range.sum())
 
         self._apply_axis_transforms(x_ch, y_ch, y_linear=is_hist)
-        if x_manual:
-            self.ax.set_xlim(x_lo, x_hi)
-        if y_manual and not is_hist:
+        self.ax.set_xlim(x_lo, x_hi)
+        if not is_hist:
             self.ax.set_ylim(y_lo, y_hi)
 
         if not is_hist:
@@ -3546,6 +3554,9 @@ class GatingApp(ttk.Frame):
         except ValueError:
             logicle_m = 4.5
         return {"log_linthresh": linthresh, "logicle_w": logicle_w, "logicle_m": logicle_m}
+
+    def _default_axis_range(self, channel: str, transform_name: str) -> tuple[float, float]:
+        return default_axis_range(transform_name, channel_range=self._channel_range(channel), **self._scale_params())
 
     def _display_transform(self, transform_name: str, channel: str) -> DisplayTransform:
         return DisplayTransform(transform_name, channel_range=self._channel_range(channel), **self._scale_params())

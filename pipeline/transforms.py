@@ -108,6 +108,30 @@ class LogicleScale(mscale.ScaleBase):
 mscale.register_scale(LogicleScale)
 
 
+def default_axis_range(
+    transform_name: str,
+    channel_range: float = 262144.0,
+    log_linthresh: float = 10.0,
+    logicle_w: float = 0.5,
+    logicle_m: float = 4.5,
+) -> tuple[float, float]:
+    """Fixed, data-independent axis range for a channel (like FlowJo): the top
+    is the instrument's channel range ($PnR), the bottom depends on the
+    transform. Because it ignores the events themselves, the axes stay put
+    when clicking through files instead of re-autoscaling per file."""
+    hi = max(float(channel_range), 1.0)
+    if transform_name == "Logicle":
+        logicle = LogicleTransform(param_t=hi, param_w=logicle_w, param_m=logicle_m, param_a=0.0)
+        lo = float(logicle.inverse(np.array([0.0]))[0])
+    elif transform_name == "Log":
+        lo = -max(log_linthresh, 1e-6)
+    else:
+        lo = 0.0
+    if not np.isfinite(lo) or lo >= hi:
+        lo = 0.0
+    return lo, hi
+
+
 def apply_axis_scale(
     ax,
     axis: str,
