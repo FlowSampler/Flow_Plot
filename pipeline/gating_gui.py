@@ -3547,6 +3547,26 @@ class GatingApp(ttk.Frame):
         for v in (self.x_min_var, self.x_max_var, self.y_min_var, self.y_max_var):
             v.set("")
 
+    @staticmethod
+    def _default_transform_for(channel: str) -> str:
+        """Scatter (FSC/SSC) and Time are shown linear, every other channel
+        (fluorescence/'color' channels) on a log axis."""
+        name = channel.upper()
+        if "FSC" in name or "SSC" in name or "TIME" in name:
+            return "Linear"
+        return "Log"
+
+    def _sync_axis_transforms(self, x_ch: str, y_ch: str):
+        """When an axis gets a DIFFERENT channel (dropdown, gate navigation,
+        new file), switch its transform to that channel's default. A transform
+        picked by hand is kept as long as the channel stays the same."""
+        last = getattr(self, "_auto_transform_channel", {})
+        for axis, ch, var in (("x", x_ch, self.x_transform_var), ("y", y_ch, self.y_transform_var)):
+            if last.get(axis) != ch:
+                var.set(self._default_transform_for(ch))
+                last[axis] = ch
+        self._auto_transform_channel = last
+
     def _redraw(self):
         if not self.current_path:
             return
@@ -3555,6 +3575,7 @@ class GatingApp(ttk.Frame):
         x_ch, y_ch = self.x_channel_var.get(), self.y_channel_var.get()
         if x_ch not in df.columns or y_ch not in df.columns:
             return
+        self._sync_axis_transforms(x_ch, y_ch)
 
         # Drill-down view: only events that passed every already-committed
         # step (saved gate-sets if enabled, plus every pending step so far)
