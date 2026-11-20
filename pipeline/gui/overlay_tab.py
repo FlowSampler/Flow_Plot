@@ -183,8 +183,8 @@ class OverlayTabMixin:
         ttk.Label(
             controls,
             text="Overlay = übereinander · Offset = vertikal versetzt · Staggered = vertikal + horizontal versetzt · "
-            "Getrennt = eigenes Panel je Datei. Reihenfolge = Reihenfolge der Liste links (per Maus sortierbar); "
-            "die oberste Datei liegt vorne/unten. \"Live\" wendet den aktuell "
+            "Getrennt = eigenes Panel je Datei. Reihenfolge ändern: Kurve bzw. ihre Beschriftung (bei Overlay den "
+            "Legendeneintrag) im Plot mit der Maus hoch/runter ziehen. \"Live\" wendet den aktuell "
             "angezeigten Knoten des Gate-Baums auf JEDE Datei an. Farben/Linien: Dateien markieren und unter 'Stil der markierten Dateien' setzen (Schema "
             "\"Dateifarben\"), eine Einheitsfarbe oder ein Farbverlauf von der ersten zur letzten Kurve.",
             foreground="#555", wraplength=1000,
@@ -198,8 +198,8 @@ class OverlayTabMixin:
         ttk.Label(files_frame, text="Dateien im Overlay", font=("", 10, "bold")).pack(anchor="w")
         ttk.Label(
             files_frame,
-            text="Strg/Shift-Klick = Mehrfachauswahl\nZeile mit der Maus ziehen = Reihenfolge im Plot\n"
-            "Farbe/Linie unten gilt für alle markierten Dateien",
+            text="Strg/Shift-Klick = Mehrfachauswahl\nFarbe/Linie unten gilt für alle markierten Dateien\n"
+            "Reihenfolge: Kurve/Beschriftung im Plot hoch/runter ziehen",
             foreground="#555", justify="left"
         ).pack(anchor="w")
         list_container = ttk.Frame(files_frame)
@@ -211,9 +211,6 @@ class OverlayTabMixin:
         ov_vsb.pack(side="right", fill="y")
         self.ov_file_listbox.bind("<<ListboxSelect>>", self._on_overlay_files_selected)
         self.ov_file_listbox.bind("<Double-Button-1>", self._overlay_pick_color)
-        self.ov_file_listbox.bind("<ButtonPress-1>", self._overlay_drag_start, add="+")
-        self.ov_file_listbox.bind("<B1-Motion>", self._overlay_drag_motion)
-        self.ov_file_listbox.bind("<ButtonRelease-1>", self._overlay_drag_end, add="+")
 
         # Style of the MARKED files: color + line style, so curves can be
         # told apart by more than color (e.g. same color = same condition,
@@ -268,6 +265,13 @@ class OverlayTabMixin:
         ov_toolbar = NavigationToolbar2Tk(self.ov_canvas, ov_toolbar_row, pack_toolbar=False)
         ov_toolbar.update()
         ov_toolbar.pack(side="left")
+        self.ov_toolbar = ov_toolbar
+        self._ov_layout = None  # curve positions of the last drawing (from draw_overlay)
+        self._ov_series_paths = []  # path of every plotted curve, in plot order
+        self._ov_plot_drag = None  # {"src", "dst", "marker"} while a curve is dragged
+        self.ov_canvas.mpl_connect("button_press_event", self._overlay_plot_press)
+        self.ov_canvas.mpl_connect("motion_notify_event", self._overlay_plot_motion)
+        self.ov_canvas.mpl_connect("button_release_event", self._overlay_plot_release)
         ttk.Button(
             ov_toolbar_row, text="Plot in Zwischenablage kopieren",
             command=lambda: self._copy_to_clipboard(self.ov_figure, self.ov_status_var)
@@ -330,33 +334,107 @@ class OverlayTabMixin:
         self._refresh_overlay_file_list(select_paths=selected)
         self._schedule_overlay_redraw()
 
-    def _overlay_drag_start(self, event):
-        self._ov_drag = None
-        if event.state & 0x0005:  # Shift/Ctrl: normal multi-selection
+    # --- reorder curves by dragging them in the plot -------------------------
+
+    def _overlay_slots(self):
+        """Pixel geometry of the plotted curves: (slots, hit) where slots[i] =
+        (y_lo, y_hi) of curve i and hit(x, y) says whether a press there may
+        start a drag (on a curve band / panel / legend entry, incl. the
+        labels left of the axes)."""
+        layout = self._ov_layout
+        if not layout or len(self._ov_series_paths) < 2:
+            return None
+        kind = layout["kind"]
+        if kind == "bands":
+            ax = layout["ax"]
+            tr = ax.get_yaxis_transform()
+            slots = [(tr.transform((0, lo))[1], tr.transform((0, hi))[1]) for lo, hi in layout["bands"]]
+            box = ax.bbox
+            return slots, lambda x, y: x <= box.x1 and box.y0 <= y <= box.y1
+        if kind == "axes":
+            boxes = [ax.bbox for ax in layout["axes"]]
+            slots = [(b.y0, b.y1) for b in boxes]
+            return slots, lambda x, y: x <= boxes[0].x1 and any(b.y0 <= y <= b.y1 for b in boxes)
+        legend = layout["ax"].get_legend()
+        if legend is None:
+            return None
+        renderer = self.ov_canvas.get_renderer()
+        slots = [(e.y0, e.y1) for e in (t.get_window_extent(renderer) for t in legend.get_texts())]
+        lbox = legend.get_window_extent(renderer)
+        return slots, lambda x, y: lbox.contains(x, y)
+
+    @staticmethod
+    def _overlay_slot_at(slots, y) -> int:
+        centers = [(lo + hi) / 2 for lo, hi in slots]
+        return int(np.argmin([abs(y - c) for c in centers]))
+
+    def _overlay_plot_press(self, event):
+        self._ov_plot_drag = None
+        if event.button != 1 or self.ov_toolbar.mode or event.x is None:
+            return  # zoom/pan of the toolbar has priority
+        geo = self._overlay_slots()
+        if geo is None:
             return
-        idx = self.ov_file_listbox.nearest(event.y)
-        if 0 <= idx < len(self.ov_order):
-            self._ov_drag = (self.ov_order[idx], False)
+        slots, hit = geo
+        if not hit(event.x, event.y):
+            return
+        src = self._overlay_slot_at(slots, event.y)
+        self._ov_plot_drag = {"src": src, "dst": src, "marker": None}
+        self.ov_canvas.get_tk_widget().configure(cursor="sb_v_double_arrow")
 
-    def _overlay_drag_motion(self, event):
-        if self._ov_drag is None:
-            return None  # let the Listbox do its normal selection sweep
-        path, _ = self._ov_drag
-        lb = self.ov_file_listbox
-        target = lb.nearest(event.y)
-        src = self.ov_order.index(path)
-        if 0 <= target < len(self.ov_order) and target != src:
-            selected = set(self._overlay_selected_paths()) | {path}
-            self.ov_order.insert(target, self.ov_order.pop(src))
-            self._refresh_overlay_file_list(select_paths=selected)
-            lb.see(target)
-            self._ov_drag = (path, True)
-        return "break"  # no rubber-band selection while dragging
+    def _overlay_plot_motion(self, event):
+        drag = self._ov_plot_drag
+        if drag is None or event.y is None:
+            return
+        geo = self._overlay_slots()
+        if geo is None:
+            return
+        slots, _ = geo
+        dst = self._overlay_slot_at(slots, event.y)
+        if dst == drag["dst"] and drag["marker"] is not None:
+            return
+        drag["dst"] = dst
+        from matplotlib.lines import Line2D
 
-    def _overlay_drag_end(self, _event):
-        drag, self._ov_drag = self._ov_drag, None
-        if drag and drag[1]:
-            self._schedule_overlay_redraw()
+        fig = self.ov_figure
+        if drag["marker"] is not None:
+            drag["marker"].remove()
+        y_frac = ((slots[dst][0] + slots[dst][1]) / 2) / fig.bbox.height
+        color = self._ov_last_result[0].series[drag["src"]].color if self._ov_last_result else "#333"
+        drag["marker"] = fig.add_artist(Line2D(
+            [0.01, 0.99], [y_frac, y_frac], transform=fig.transFigure,
+            color=color, linewidth=2.5, linestyle="--", alpha=0.9, zorder=100,
+        ))
+        name = os.path.basename(self._ov_series_paths[drag["src"]])
+        self.ov_status_var.set(f"Verschiebe {name} → Position {dst + 1} von {len(slots)} (loslassen zum Ablegen)")
+        self.ov_canvas.draw_idle()
+
+    def _overlay_plot_release(self, _event):
+        drag, self._ov_plot_drag = self._ov_plot_drag, None
+        if drag is None:
+            return
+        self.ov_canvas.get_tk_widget().configure(cursor="")
+        if drag["marker"] is not None:
+            drag["marker"].remove()
+        if drag["dst"] == drag["src"]:
+            self.ov_canvas.draw_idle()
+            self._schedule_overlay_redraw()  # restore the status line
+            return
+        self._overlay_move_series(drag["src"], drag["dst"])
+
+    def _overlay_move_series(self, src: int, dst: int):
+        """Move plotted curve src to position dst. Only the plotted files swap
+        places among their own slots in the overlay order, so unselected
+        files (and skipped ones) keep their positions."""
+        paths = list(self._ov_series_paths)
+        paths.insert(dst, paths.pop(src))
+        if self.ov_reverse_var.get():
+            paths = paths[::-1]  # plot order -> list order
+        slots = sorted(self.ov_order.index(p) for p in paths)
+        for slot, p in zip(slots, paths):
+            self.ov_order[slot] = p
+        self._refresh_overlay_file_list()
+        self._schedule_overlay_redraw()
 
     def _refresh_overlay_file_list(self, select_paths: set[str] | None = None):
         """Rebuild the overlay file list (keeps the current selection unless
@@ -525,6 +603,7 @@ class OverlayTabMixin:
                 linestyle=OVERLAY_LINESTYLES[self._overlay_linestyle_name(path)][0],
             ))
             series_paths.append(path)
+        self._ov_series_paths = series_paths
 
         # Scheme colors are assigned by position among the PLOTTED curves, so a
         # gradient always spans first -> last curve; the file list rows are
@@ -576,7 +655,8 @@ class OverlayTabMixin:
                     x_lo if x_lo is not None else float(result.centers_raw[0]),
                     x_hi if x_hi is not None else float(result.centers_raw[-1]),
                 )
-            draw_overlay(
+            self._ov_plot_drag = None  # the figure is rebuilt: any drag marker is gone
+            self._ov_layout = draw_overlay(
                 self.ov_figure, result, tr, self.ov_display_var.get(), x_label,
                 title=f"Population: {pop}",
                 offset_frac=num(self.ov_offset_var, 60, 0) / 100.0,
@@ -589,6 +669,7 @@ class OverlayTabMixin:
             except Exception:
                 pass
         except Exception as exc:
+            self._ov_layout = None
             self.ov_status_var.set(f"Fehler beim Zeichnen: {exc}")
             return
         self.ov_canvas.draw_idle()

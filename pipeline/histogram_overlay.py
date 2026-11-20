@@ -247,7 +247,12 @@ def draw_overlay(
     x_limits: tuple[float, float] | None = None,
 ):
     """Draw into fig (cleared first). Series order = drawing order: the
-    first series is the bottom/front curve in Offset/Staggered modes."""
+    first series is the bottom/front curve in Offset/Staggered modes.
+
+    Returns where each curve sits, so the GUI can let the user drag curves
+    to reorder them: {"kind": "bands", "ax", "bands": [(y_lo, y_hi) data]}
+    (Offset/Staggered), {"kind": "axes", "axes": [...]} (Panels) or
+    {"kind": "legend", "ax"} (Overlay: legend entries); None if empty."""
     fig.clear()
     series, curves, x = result.series, result.curves, result.centers_raw
     n = len(series)
@@ -256,7 +261,7 @@ def draw_overlay(
         ax.text(0.5, 0.5, "Keine Dateien ausgewählt / keine gültigen Werte",
                 ha="center", va="center", transform=ax.transAxes, color="#777")
         ax.set_axis_off()
-        return
+        return None
 
     y_max = max((float(c.max()) for c in curves if len(c)), default=1.0) or 1.0
     t_x = tr.forward(x)
@@ -277,9 +282,10 @@ def draw_overlay(
         fig.supylabel(result.y_label, fontsize=9)
         if title:
             fig.suptitle(title, fontsize=10)
-        return
+        return {"kind": "axes", "axes": list(axes)}
 
     ax = fig.add_subplot(111)
+    layout = {"kind": "legend", "ax": ax}
     tr.apply_to(ax)
 
     if mode == "Overlay":
@@ -311,6 +317,8 @@ def draw_overlay(
         ax.set_ylabel(f"{result.y_label} (versetzt)")
         if dx_t:
             x_label += "   (diagonal versetzt — X-Werte exakt nur für die vorderste Kurve)"
+        layout = {"kind": "bands", "ax": ax, "bands": [(b, b + step) for b in bases]}
     ax.set_xlabel(x_label)
     if title:
         ax.set_title(title, fontsize=10)
+    return layout
