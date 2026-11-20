@@ -132,10 +132,18 @@ class OverlayTabMixin:
         self.ov_alpha_var = tk.StringVar(value="0.35")
         ov_alpha_entry = ttk.Entry(controls, textvariable=self.ov_alpha_var, width=6)
         ov_alpha_entry.grid(row=3, column=7, padx=4, pady=(6, 0), sticky="w")
-        self.ov_alpha_widgets = [ov_alpha_label, ov_alpha_entry]  # only when "Gefüllt"
-
         check_row = ttk.Frame(controls)
         check_row.grid(row=4, column=0, columnspan=10, sticky="w", pady=(6, 0))
+        # Offset/Staggered + filled: front curves hide the ones behind (opaque),
+        # or let them show through the semi-transparent fill.
+        self.ov_see_through_var = tk.BooleanVar(value=False)
+        ov_see_through_cb = ttk.Checkbutton(
+            controls, text="Durchscheinend (hintere Kurven sichtbar)", variable=self.ov_see_through_var,
+            command=redraw,
+        )
+        ov_see_through_cb.grid(row=3, column=8, columnspan=2, padx=(12, 0), pady=(6, 0), sticky="w")
+        self.ov_see_through_widgets = [ov_see_through_cb]
+        self.ov_alpha_widgets = [ov_alpha_label, ov_alpha_entry]  # only when "Gefüllt"
         self.ov_fill_var = tk.BooleanVar(value=True)
         self.ov_reverse_var = tk.BooleanVar(value=False)
         self.ov_stats_var = tk.BooleanVar(value=True)
@@ -300,6 +308,7 @@ class OverlayTabMixin:
         self._set_shown(self.ov_offset_widgets, display in ("Offset", "Staggered"))
         self._set_shown(self.ov_stagger_widgets, display == "Staggered")
         self._set_shown(self.ov_alpha_widgets, self.ov_fill_var.get())
+        self._set_shown(self.ov_see_through_widgets, self.ov_fill_var.get() and display in ("Offset", "Staggered"))
         if self.ov_scheme_var.get() == SCHEME_SINGLE:
             self.ov_single_color_btn.pack(side="left", padx=(0, 16))
         else:
@@ -663,6 +672,7 @@ class OverlayTabMixin:
                 stagger_frac=num(self.ov_stagger_var, 5, 0) / 100.0,
                 fill=self.ov_fill_var.get(), alpha=num(self.ov_alpha_var, 0.35, 0.0, 1.0),
                 legend_stats=self.ov_stats_var.get(), x_limits=x_limits,
+                occlude=not self.ov_see_through_var.get(),
             )
             try:
                 self.ov_figure.tight_layout()

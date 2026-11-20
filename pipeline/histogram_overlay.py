@@ -245,9 +245,13 @@ def draw_overlay(
     alpha: float = 0.35,
     legend_stats: bool = True,
     x_limits: tuple[float, float] | None = None,
+    occlude: bool = True,
 ):
     """Draw into fig (cleared first). Series order = drawing order: the
     first series is the bottom/front curve in Offset/Staggered modes.
+    ``occlude`` (Offset/Staggered): an opaque underlay makes front curves hide
+    the ones behind; False lets the curves behind shine through the
+    semi-transparent fills, like in Overlay mode.
 
     Returns where each curve sits, so the GUI can let the user drag curves
     to reorder them: {"kind": "bands", "ax", "bands": [(y_lo, y_hi) data]}
@@ -305,7 +309,7 @@ def draw_overlay(
             xi = tr.inverse(t_x + i * dx_t) if dx_t else x
             ax.plot([xi[0], xi[-1]], [bases[i], bases[i]], color=s.color, linewidth=0.6,
                     alpha=0.6, zorder=2 + 2 * (n - i))
-            _draw_curve(ax, xi, y, bases[i], s.color, fill, alpha, 2 + 2 * (n - i), True,
+            _draw_curve(ax, xi, y, bases[i], s.color, fill, alpha, 2 + 2 * (n - i), occlude,
                         linewidth=s.linewidth, linestyle=s.linestyle)
         hi_t = tr.forward([hi_raw])[0] + (n - 1) * dx_t
         ax.set_xlim(lo_raw, float(tr.inverse([hi_t])[0]))
