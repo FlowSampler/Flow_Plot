@@ -37,6 +37,7 @@ from gui.overlay_tab import OverlayTabMixin
 from gui.panel_tab import PanelTabMixin
 from gui.wsp_dialog import WspImportMixin
 from gui.derived_dialog import DerivedParamsMixin
+from gui.metadata_dialog import MetadataInspectorMixin
 from gui.experiment import ExperimentMixin
 from gui.data_access import DataAccessMixin
 from gui.common import CommonMixin
@@ -55,6 +56,7 @@ class GatingApp(
     PanelTabMixin,
     WspImportMixin,
     DerivedParamsMixin,
+    MetadataInspectorMixin,
     ExperimentMixin,
     DataAccessMixin,
     CommonMixin,
@@ -210,11 +212,16 @@ class GatingApp(
         self.file_listbox.pack(fill="both", expand=True, padx=4, pady=4)
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_selected)
         self.file_listbox.bind("<Delete>", lambda _e: self._exclude_selected_files())
+        self.file_listbox.bind("<Double-Button-1>", self._open_metadata_inspector)
+        self.master.bind_all("<Control-i>", self._open_metadata_inspector)
 
         nav = ttk.Frame(left)
         nav.pack(fill="x", padx=4, pady=(0, 4))
         ttk.Button(nav, text="<< Prev", command=self._prev_file).pack(side="left", expand=True, fill="x")
         ttk.Button(nav, text="Next >>", command=self._next_file).pack(side="left", expand=True, fill="x")
+        ttk.Button(
+            left, text="Metadaten / Spannungen anzeigen (Strg+I)...", command=self._open_metadata_inspector
+        ).pack(fill="x", padx=4, pady=(0, 4))
 
         excl = ttk.Frame(left)
         excl.pack(fill="x", padx=4, pady=(0, 4))

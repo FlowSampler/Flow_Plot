@@ -369,6 +369,7 @@ class ExperimentMixin:
 
         self._refresh_comp_channels(channels)
         self._redraw_visible_tab()
+        self._sync_metadata_inspector()
 
     def _on_file_selected(self, _event):
         sel = self.file_listbox.curselection()
