@@ -105,6 +105,8 @@ class GatingApp(
         self.kin_point_color = "#1f4e8c"
         self.ov_colors: dict[str, str] = {}  # per-file color overrides for the overlay tab (path -> hex)
         self.ov_linestyles: dict[str, str] = {}  # per-file line style for the overlay tab (path -> OVERLAY_LINESTYLES key)
+        self.ov_order: list[str] = []  # overlay list/plot order (paths), user-sortable by drag & drop
+        self._ov_drag = None  # (path, moved) while a row of the overlay list is being dragged
         self.ov_single_color = "#1f77b4"  # curve color for the "Einheitsfarbe" scheme
         self._ov_redraw_job = None
         self._ov_last_result = None

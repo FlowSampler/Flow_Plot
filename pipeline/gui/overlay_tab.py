@@ -183,7 +183,8 @@ class OverlayTabMixin:
         ttk.Label(
             controls,
             text="Overlay = übereinander · Offset = vertikal versetzt · Staggered = vertikal + horizontal versetzt · "
-            "Getrennt = eigenes Panel je Datei. Die erste Datei liegt vorne/unten. \"Live\" wendet den aktuell "
+            "Getrennt = eigenes Panel je Datei. Reihenfolge = Reihenfolge der Liste links (per Maus sortierbar); "
+            "die oberste Datei liegt vorne/unten. \"Live\" wendet den aktuell "
             "angezeigten Knoten des Gate-Baums auf JEDE Datei an. Farben/Linien: Dateien markieren und unter 'Stil der markierten Dateien' setzen (Schema "
             "\"Dateifarben\"), eine Einheitsfarbe oder ein Farbverlauf von der ersten zur letzten Kurve.",
             foreground="#555", wraplength=1000,
@@ -197,7 +198,8 @@ class OverlayTabMixin:
         ttk.Label(files_frame, text="Dateien im Overlay", font=("", 10, "bold")).pack(anchor="w")
         ttk.Label(
             files_frame,
-            text="Strg/Shift-Klick = Mehrfachauswahl\nFarbe/Linie unten gilt für alle markierten Dateien",
+            text="Strg/Shift-Klick = Mehrfachauswahl\nZeile mit der Maus ziehen = Reihenfolge im Plot\n"
+            "Farbe/Linie unten gilt für alle markierten Dateien",
             foreground="#555", justify="left"
         ).pack(anchor="w")
         list_container = ttk.Frame(files_frame)
@@ -209,6 +211,9 @@ class OverlayTabMixin:
         ov_vsb.pack(side="right", fill="y")
         self.ov_file_listbox.bind("<<ListboxSelect>>", self._on_overlay_files_selected)
         self.ov_file_listbox.bind("<Double-Button-1>", self._overlay_pick_color)
+        self.ov_file_listbox.bind("<ButtonPress-1>", self._overlay_drag_start, add="+")
+        self.ov_file_listbox.bind("<B1-Motion>", self._overlay_drag_motion)
+        self.ov_file_listbox.bind("<ButtonRelease-1>", self._overlay_drag_end, add="+")
 
         # Style of the MARKED files: color + line style, so curves can be
         # told apart by more than color (e.g. same color = same condition,
@@ -247,6 +252,9 @@ class OverlayTabMixin:
         ttk.Entry(filter_row, textvariable=self.ov_filter_var, width=12).pack(side="left", padx=4, fill="x", expand=True)
         ttk.Button(filter_row, text="Auswählen", command=self._overlay_select_by_filter).pack(side="left")
         ttk.Button(files_frame, text="Farben & Linien zurücksetzen", command=self._overlay_reset_colors).pack(
+            fill="x", pady=(4, 0)
+        )
+        ttk.Button(files_frame, text="Reihenfolge zurücksetzen", command=self._overlay_reset_order).pack(
             fill="x", pady=(4, 0)
         )
 
@@ -300,8 +308,55 @@ class OverlayTabMixin:
             return self.ov_colors[path]
         return default_color(self.fcs_paths.index(path) if path in self.fcs_paths else 0)
 
+    def _overlay_sync_order(self) -> list[str]:
+        """The overlay's own file order: user-sorted paths that still exist,
+        then newly loaded files in experiment order. Independent of the main
+        file list, so sorting here never reorders the experiment."""
+        present = set(self.fcs_paths)
+        order = [p for p in self.ov_order if p in present]
+        known = set(order)
+        order += [p for p in self.fcs_paths if p not in known]
+        self.ov_order = order
+        return order
+
     def _overlay_selected_paths(self) -> list[str]:
-        return [self.fcs_paths[i] for i in self.ov_file_listbox.curselection() if i < len(self.fcs_paths)]
+        """Marked files in list order (= plot order), not in click order."""
+        order = self.ov_order
+        return [order[i] for i in self.ov_file_listbox.curselection() if i < len(order)]
+
+    def _overlay_reset_order(self):
+        selected = set(self._overlay_selected_paths())
+        self.ov_order = []
+        self._refresh_overlay_file_list(select_paths=selected)
+        self._schedule_overlay_redraw()
+
+    def _overlay_drag_start(self, event):
+        self._ov_drag = None
+        if event.state & 0x0005:  # Shift/Ctrl: normal multi-selection
+            return
+        idx = self.ov_file_listbox.nearest(event.y)
+        if 0 <= idx < len(self.ov_order):
+            self._ov_drag = (self.ov_order[idx], False)
+
+    def _overlay_drag_motion(self, event):
+        if self._ov_drag is None:
+            return None  # let the Listbox do its normal selection sweep
+        path, _ = self._ov_drag
+        lb = self.ov_file_listbox
+        target = lb.nearest(event.y)
+        src = self.ov_order.index(path)
+        if 0 <= target < len(self.ov_order) and target != src:
+            selected = set(self._overlay_selected_paths()) | {path}
+            self.ov_order.insert(target, self.ov_order.pop(src))
+            self._refresh_overlay_file_list(select_paths=selected)
+            lb.see(target)
+            self._ov_drag = (path, True)
+        return "break"  # no rubber-band selection while dragging
+
+    def _overlay_drag_end(self, _event):
+        drag, self._ov_drag = self._ov_drag, None
+        if drag and drag[1]:
+            self._schedule_overlay_redraw()
 
     def _refresh_overlay_file_list(self, select_paths: set[str] | None = None):
         """Rebuild the overlay file list (keeps the current selection unless
@@ -310,7 +365,7 @@ class OverlayTabMixin:
             select_paths = set(self._overlay_selected_paths())
         lb = self.ov_file_listbox
         lb.delete(0, "end")
-        for i, p in enumerate(self.fcs_paths):
+        for i, p in enumerate(self._overlay_sync_order()):
             marker = OVERLAY_LINESTYLES[self._overlay_linestyle_name(p)][1]
             lb.insert("end", os.path.relpath(p, self.input_dir) + (f"   [{marker}]" if marker else ""))
             color = self._overlay_color(p)
@@ -330,11 +385,11 @@ class OverlayTabMixin:
 
     def _overlay_pick_color(self, event):
         idx = self.ov_file_listbox.nearest(event.y)
-        if idx < 0 or idx >= len(self.fcs_paths):
+        if idx < 0 or idx >= len(self.ov_order):
             return
         from tkinter import colorchooser
 
-        path = self.fcs_paths[idx]
+        path = self.ov_order[idx]
         _, hex_color = colorchooser.askcolor(
             color=self._overlay_color(path), title=f"Farbe für {os.path.basename(path)}", parent=self
         )
@@ -478,7 +533,7 @@ class OverlayTabMixin:
         if colors is not None:
             for s, c, p in zip(series, colors, series_paths):
                 s.color = c
-                i = self.fcs_paths.index(p)
+                i = self.ov_order.index(p)
                 self.ov_file_listbox.itemconfig(i, foreground=c, selectbackground=c, selectforeground="white")
         return series, x_label, skipped
 

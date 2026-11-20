@@ -319,6 +319,7 @@ class ExperimentMixin:
         self._refresh_strategy_combo()
         self.ov_colors.clear()
         self.ov_linestyles.clear()
+        self.ov_order = []
         self._refresh_overlay_file_list(select_paths=set())
         self._select_file_index(0)
         self.status_var.set(
