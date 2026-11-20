@@ -117,6 +117,10 @@ class KineticsTabMixin:
         ttk.Button(
             controls, text="Alle Kinetik-Plots als PNG exportieren", command=self._export_all_kinetics_png
         ).grid(row=5, column=3, columnspan=3, padx=(4, 4), pady=(6, 0), sticky="w")
+        ttk.Button(
+            controls, text="Plot exportieren (Größe, Beschriftung)...",
+            command=lambda: self._open_plot_export(self.kin_figure, self.kin_canvas, "kinetik", self.kin_status_var)
+        ).grid(row=5, column=6, columnspan=3, padx=(4, 4), pady=(6, 0), sticky="w")
         ttk.Label(
             controls, text="(Zwischenablage: direkt mit Strg+V in PowerPoint/Word einfügbar, kein Screenshot nötig)",
             foreground="#555"

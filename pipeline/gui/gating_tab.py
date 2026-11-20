@@ -162,6 +162,10 @@ class GatingTabMixin:
             toolbar_row, text="Plot in Zwischenablage kopieren",
             command=lambda: self._copy_to_clipboard(self.figure, self.status_var)
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            toolbar_row, text="Plot exportieren...",
+            command=lambda: self._open_plot_export(self.figure, self.canvas, "gating", self.status_var)
+        ).pack(side="left", padx=(4, 0))
 
         self.status_var = tk.StringVar(
             value="Bereit. Doppelklick IN ein Gate wechselt in dessen Population. "

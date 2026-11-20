@@ -100,9 +100,15 @@ class CompensationTabMixin:
         self.comp_canvas.mpl_connect("button_press_event", self._comp_on_press)
         self.comp_canvas.mpl_connect("motion_notify_event", self._comp_on_motion)
         self.comp_canvas.mpl_connect("button_release_event", self._comp_on_release)
+        comp_btn_row = ttk.Frame(plot_frame)
+        comp_btn_row.pack(anchor="w", pady=(4, 0))
         ttk.Button(
-            plot_frame, text="Plot in Zwischenablage kopieren", command=lambda: self._copy_to_clipboard(self.comp_figure)
-        ).pack(anchor="w", pady=(4, 0))
+            comp_btn_row, text="Plot in Zwischenablage kopieren", command=lambda: self._copy_to_clipboard(self.comp_figure)
+        ).pack(side="left")
+        ttk.Button(
+            comp_btn_row, text="Plot exportieren...",
+            command=lambda: self._open_plot_export(self.comp_figure, self.comp_canvas, "kompensation")
+        ).pack(side="left", padx=(4, 0))
 
         grid_outer = ttk.Frame(body)
         body.add(grid_outer, weight=1)

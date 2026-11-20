@@ -1,6 +1,7 @@
 """Small helpers shared by several tabs."""
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from tkinter import messagebox
 
@@ -60,6 +61,23 @@ class CommonMixin:
             transform_name, channel_range=channel_range,
             log_linthresh=linthresh, logicle_w=logicle_w, logicle_m=logicle_m,
         )
+
+    def _open_plot_export(self, figure, canvas=None, suffix: str = "plot",
+                          status_var: tk.StringVar | None = None):
+        """'Plot exportieren...' dialog (size, DPI, format, labels, fonts)."""
+        from gui.plot_export_dialog import PlotExportDialog
+
+        if not figure.axes:
+            messagebox.showinfo("Plot exportieren", "Es ist noch kein Plot zu sehen.")
+            return
+        stem = os.path.splitext(os.path.basename(self.current_path))[0] if self.current_path else ""
+        name = f"{stem}_{suffix}" if stem else suffix
+        try:
+            initialdir = self._ensure_exports_dir()
+        except OSError:
+            initialdir = None
+        PlotExportDialog(self, figure, canvas=canvas, initialdir=initialdir,
+                         default_name=name, status_var=status_var)
 
     def _copy_to_clipboard(self, figure, status_var: tk.StringVar | None = None):
         try:

@@ -89,9 +89,15 @@ class StatsTabMixin:
         self.stat_canvas = FigureCanvasTkAgg(self.stat_figure, master=plot_frame)
         self.stat_canvas.get_tk_widget().pack(fill="both", expand=True)
         self.stat_canvas.mpl_connect("button_press_event", self._on_stat_hist_click)
+        stat_btn_row = ttk.Frame(plot_frame)
+        stat_btn_row.pack(anchor="w", pady=(4, 0))
         ttk.Button(
-            plot_frame, text="Plot in Zwischenablage kopieren", command=lambda: self._copy_to_clipboard(self.stat_figure)
-        ).pack(anchor="w", pady=(4, 0))
+            stat_btn_row, text="Plot in Zwischenablage kopieren", command=lambda: self._copy_to_clipboard(self.stat_figure)
+        ).pack(side="left")
+        ttk.Button(
+            stat_btn_row, text="Plot exportieren...",
+            command=lambda: self._open_plot_export(self.stat_figure, self.stat_canvas, "statistik")
+        ).pack(side="left", padx=(4, 0))
 
         info_frame = ttk.Frame(body, width=260)
         body.add(info_frame, weight=0)

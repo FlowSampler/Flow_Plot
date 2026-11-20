@@ -264,6 +264,10 @@ class OverlayTabMixin:
             ov_toolbar_row, text="Plot in Zwischenablage kopieren",
             command=lambda: self._copy_to_clipboard(self.ov_figure, self.ov_status_var)
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            ov_toolbar_row, text="Plot exportieren...",
+            command=lambda: self._open_plot_export(self.ov_figure, self.ov_canvas, "histogramm", self.ov_status_var)
+        ).pack(side="left", padx=(4, 0))
         ttk.Button(ov_toolbar_row, text="Histogramm-Daten als CSV", command=self._export_overlay_csv).pack(
             side="left", padx=(4, 0)
         )
